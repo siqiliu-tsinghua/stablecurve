@@ -3,8 +3,12 @@
 //!
 //! 递归内部 τ 指数用 i64（−1 出现于递归中间态，命中即不变量为零——
 //! GWall 的 `member(-1,tlist)` 检查）。记忆化对应原版 `option remember`。
-//! τ₁ 在 GW 入口排序（原版 'reorder tau_1 for maximum efficiency'）；
 //! 环路插入可任意排序：gw 前端把交错的 a/b 环路换到规范序（a 在前）并计入符号。
+//!
+//! 记忆化键规范化（[`Normal`]）：偶类插入（τ(1)、τ(pt)、ch(O)、ch(L)）可交换，
+//! 排序；奇类环路插入反交换，a、b 各自排序并记下置换符号，两个相同的奇类插入
+//! 使不变量为零。原版只排序 τ₁（'reorder tau_1 for maximum efficiency'），同一
+//! 不变量以不同插入顺序反复出现时各算一遍（z(3,2,8) 的未命中 410 万 → 15 万）。
 
 use crate::gwloop::{LoopIns, fast_gwloop, gwloop as gwloop_slow};
 use crate::qseries::bernoulli;
@@ -79,6 +83,60 @@ fn harm(a: u32, b: u32) -> Q {
     v
 }
 
+/// 递归入口参数的规范形（见模块注释）：值 = sign · ⟨规范序插入⟩。
+struct Normal {
+    t1: Vec<i64>,
+    ta: Vec<(i64, i64)>,
+    tb: Vec<(i64, i64)>,
+    tp: Vec<i64>,
+    sign: Q,
+}
+
+impl Normal {
+    /// 不变量为零时返回 None：两个相同的奇类插入（反交换），或 a、b 环路个数
+    /// 不等（递归只成对增删环路，闭式层个数不等即为零；GWomega 的 H 分支
+    /// 按同一下标同时改 a、b，个数不等时还会越界）。
+    fn new(t1: &[i64], ta: &[(i64, i64)], tb: &[(i64, i64)], tp: &[i64]) -> Option<Self> {
+        if ta.len() != tb.len() {
+            return None;
+        }
+        let (ta, sa) = sort_odd(ta)?;
+        let (tb, sb) = sort_odd(tb)?;
+        Some(Normal {
+            t1: sorted(t1),
+            ta,
+            tb,
+            tp: sorted(tp),
+            sign: Q::from(sa * sb),
+        })
+    }
+}
+
+fn sorted(v: &[i64]) -> Vec<i64> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v
+}
+
+/// 奇类插入按 (τ, 指标) 排序，返回置换符号；有两个相同的插入 → None。
+fn sort_odd(v: &[(i64, i64)]) -> Option<(Vec<(i64, i64)>, i64)> {
+    let mut w = v.to_vec();
+    let mut sign = 1i64;
+    // 插入排序（列表很短），每次相邻对换翻转符号
+    for i in 1..w.len() {
+        let mut j = i;
+        while j > 0 && w[j - 1] > w[j] {
+            w.swap(j - 1, j);
+            sign = -sign;
+            j -= 1;
+        }
+    }
+    if w.windows(2).any(|p| p[0] == p[1]) {
+        return None;
+    }
+    Some((w, sign))
+}
+
 /// tlist 检查：任一 τ 指数为 −1 → 不变量为零。
 fn has_neg1(t1: &[i64], ta: &[(i64, i64)], tb: &[(i64, i64)], tp: &[i64]) -> bool {
     t1.contains(&-1) || tp.contains(&-1) || ta.iter().chain(tb).any(|&(t, _)| t == -1)
@@ -122,26 +180,30 @@ impl Ctx {
         tb: &[(i64, i64)],
         tp: &[i64],
     ) -> Q {
-        let mut t1: Vec<i64> = t1.to_vec();
-        t1.sort_unstable(); // 原版入口排序（remember 效率）
+        let Some(nf) = Normal::new(t1, ta, tb, tp) else {
+            return Q::ZERO;
+        };
         let key = (
             0u8,
             g,
             d,
             vec![],
             vec![],
-            t1.clone(),
-            ta.to_vec(),
-            tb.to_vec(),
-            tp.to_vec(),
+            nf.t1.clone(),
+            nf.ta.clone(),
+            nf.tb.clone(),
+            nf.tp.clone(),
             0,
         );
-        if let Some(v) = self.mem.get(&key) {
-            return v.clone();
-        }
-        let val = self.gw_body(g, d, &t1, ta, tb, tp);
-        self.mem.insert(key, val.clone());
-        val
+        let val = match self.mem.get(&key) {
+            Some(v) => v.clone(),
+            None => {
+                let v = self.gw_body(g, d, &nf.t1, &nf.ta, &nf.tb, &nf.tp);
+                self.mem.insert(key, v.clone());
+                v
+            }
+        };
+        val * nf.sign
     }
 
     fn gw_body(
@@ -324,24 +386,31 @@ impl Ctx {
         if th.iter().any(|&h| h <= 0 || h % 2 == 0) {
             return Q::ZERO;
         }
+        let Some(nf) = Normal::new(t1, ta, tb, tp) else {
+            return Q::ZERO;
+        };
+        let th = sorted(th);
         let key = (
             1u8,
             g,
             d,
             vec![],
-            th.to_vec(),
-            t1.to_vec(),
-            ta.to_vec(),
-            tb.to_vec(),
-            tp.to_vec(),
+            th.clone(),
+            nf.t1.clone(),
+            nf.ta.clone(),
+            nf.tb.clone(),
+            nf.tp.clone(),
             0,
         );
-        if let Some(v) = self.mem.get(&key) {
-            return v.clone();
-        }
-        let val = self.gwhodge_body(g, d, th, t1, ta, tb, tp);
-        self.mem.insert(key, val.clone());
-        val
+        let val = match self.mem.get(&key) {
+            Some(v) => v.clone(),
+            None => {
+                let v = self.gwhodge_body(g, d, &th, &nf.t1, &nf.ta, &nf.tb, &nf.tp);
+                self.mem.insert(key, v.clone());
+                v
+            }
+        };
+        val * nf.sign
     }
 
     fn gwhodge_body(
@@ -429,24 +498,31 @@ impl Ctx {
         if to.iter().any(|&w| w <= 0) || th.iter().any(|&h| h <= 0 || h % 2 == 0) {
             return Q::ZERO;
         }
+        let Some(nf) = Normal::new(t1, ta, tb, tp) else {
+            return Q::ZERO;
+        };
+        let (to, th) = (sorted(to), sorted(th));
         let key = (
             2u8,
             g,
             d,
-            to.to_vec(),
-            th.to_vec(),
-            t1.to_vec(),
-            ta.to_vec(),
-            tb.to_vec(),
-            tp.to_vec(),
+            to.clone(),
+            th.clone(),
+            nf.t1.clone(),
+            nf.ta.clone(),
+            nf.tb.clone(),
+            nf.tp.clone(),
             deg,
         );
-        if let Some(v) = self.mem.get(&key) {
-            return v.clone();
-        }
-        let val = self.gwomega_body(g, d, to, th, t1, ta, tb, tp, deg);
-        self.mem.insert(key, val.clone());
-        val
+        let val = match self.mem.get(&key) {
+            Some(v) => v.clone(),
+            None => {
+                let v = self.gwomega_body(g, d, &to, &th, &nf.t1, &nf.ta, &nf.tb, &nf.tp, deg);
+                self.mem.insert(key, v.clone());
+                v
+            }
+        };
+        val * nf.sign
     }
 
     fn gwomega_body(
@@ -723,6 +799,90 @@ mod tests {
             gw_ctx(&mut ctx, 2, 1, &l) / vx - Q::from(n as i64)
         };
         assert_eq!(a_of(2), a_of(3), "dilaton 系数应与 n 无关");
+    }
+
+    /// 记忆化键规范化：同一上下文中先算打乱顺序的插入、再算规范顺序的（后者
+    /// 命中前者存下的规范形），两者只差 a、b 各自的置换符号；偶类插入顺序无关。
+    #[test]
+    fn memo_normalization_signs() {
+        // 值与 v0.1.0（无规范化）逐字一致
+        let shuffled_ins = [
+            Ins::ChL(1),
+            Ins::A(1, 2),
+            Ins::A(0, 2),
+            Ins::B(0, 2),
+            Ins::ChO(5),
+            Ins::B(1, 2),
+        ];
+        let mut ctx = Ctx::new();
+        let shuffled = gw_ctx(&mut ctx, 2, 3, &shuffled_ins);
+        assert_eq!(shuffled.to_string(), "41833459363/111476736000");
+        let canon = gw_ctx(
+            &mut ctx,
+            2,
+            3,
+            &[
+                Ins::A(0, 2),
+                Ins::A(1, 2),
+                Ins::B(0, 2),
+                Ins::B(1, 2),
+                Ins::ChO(5),
+                Ins::ChL(1),
+            ],
+        );
+        // a 侧差一次对换：符号相反
+        assert_eq!(canon, -shuffled.clone());
+        // 新上下文先算规范序、再算打乱序（命中顺序反过来）
+        let mut ctx2 = Ctx::new();
+        assert_eq!(
+            gw_ctx(
+                &mut ctx2,
+                2,
+                3,
+                &[
+                    Ins::A(0, 2),
+                    Ins::A(1, 2),
+                    Ins::B(0, 2),
+                    Ins::B(1, 2),
+                    Ins::ChO(5),
+                    Ins::ChL(1)
+                ]
+            ),
+            canon
+        );
+        assert_eq!(gw_ctx(&mut ctx2, 2, 3, &shuffled_ins), shuffled);
+        // 两个相同的奇类插入：反交换 ⇒ 零
+        assert_eq!(
+            gw(
+                2,
+                1,
+                &[Ins::A(0, 1), Ins::A(0, 1), Ins::B(0, 1), Ins::B(1, 1)]
+            ),
+            Q::ZERO
+        );
+    }
+
+    /// 回归：a、b 环路个数不等时不变量为零。GWomega 的 H 分支按同一下标同时
+    /// 改 a、b，原先在 a 多于 b 时越界 panic（批处理整个进程退出）。
+    #[test]
+    fn unequal_loop_counts_vanish() {
+        assert_eq!(gw(1, 1, &[Ins::A(1, 1), Ins::ChL(3)]), Q::ZERO);
+        assert_eq!(
+            gw(
+                3,
+                2,
+                &[
+                    Ins::T1(2),
+                    Ins::A(2, 2),
+                    Ins::B(2, 2),
+                    Ins::Pt(2),
+                    Ins::A(1, 2),
+                    Ins::ChL(3)
+                ]
+            ),
+            Q::ZERO
+        );
+        assert_eq!(gw(2, 1, &[Ins::B(0, 1), Ins::ChL(1)]), Q::ZERO);
     }
 
     /// 环路反交换：交错给出 a/b 环路与规范序（a 在前）只差对换符号；
