@@ -4,7 +4,7 @@
 //! 构造器（基本类 / ψ / κ）与线性代数；乘法与前推在 M1/M2 加入。
 
 use crate::graph::StableGraph;
-use crate::kppoly::KappaPsiPolynomial;
+use crate::kppoly::{KappaPsiPolynomial, KpTerm};
 use sc_num::{Q, Zero};
 
 /// 装饰 stratum：稳定图 + 其上的 κ-ψ 多项式。
@@ -21,22 +21,39 @@ pub struct TautClass {
 }
 
 impl TautClass {
-    /// 由项表构造规范形。
+    /// 由项表构造规范形。同图项的多项式收集后一次规范化——逐个 `add`
+    /// 每次都整体重排，同图项多时（如 Θ 的基本类上的全部 κ-ψ 装饰）退化为
+    /// 平方复杂度。
     pub fn new(terms: Vec<DecStratum>) -> Self {
         let mut ts = terms;
         ts.sort_by(|a, b| a.graph.cmp(&b.graph));
         let mut merged: Vec<DecStratum> = Vec::with_capacity(ts.len());
-        for t in ts {
-            if let Some(last) = merged.last_mut() {
-                if last.graph == t.graph {
-                    last.poly = last.poly.add(&t.poly);
-                    continue;
-                }
+        let mut it = ts.into_iter().peekable();
+        while let Some(first) = it.next() {
+            let mut rest: Vec<KpTerm> = Vec::new();
+            while let Some(t) = it.next_if(|t| t.graph == first.graph) {
+                rest.extend(t.poly.terms);
             }
-            merged.push(t);
+            let poly = if rest.is_empty() {
+                first.poly
+            } else {
+                let mut all = first.poly.terms;
+                all.extend(rest);
+                KappaPsiPolynomial::new(all)
+            };
+            if !poly.is_zero() {
+                merged.push(DecStratum {
+                    graph: first.graph,
+                    poly,
+                });
+            }
         }
-        merged.retain(|t| !t.poly.is_zero());
         TautClass { terms: merged }
+    }
+
+    /// 多个类之和，一次规范化（循环里反复 [`TautClass::add`] 是平方复杂度）。
+    pub fn sum<I: IntoIterator<Item = TautClass>>(parts: I) -> Self {
+        Self::new(parts.into_iter().flat_map(|c| c.terms).collect())
     }
 
     pub fn zero() -> Self {

@@ -192,12 +192,12 @@ fn todd_inv_sigma(t: u32, g: u32, n: u32) -> TautClass {
         }
         acc
     };
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     if g >= 1 {
         let legs: Vec<u32> = (1..=n + 2).collect();
         let graph = StableGraph::new(&[g - 1], &[legs], &[(n + 1, n + 2)]).unwrap();
-        result = result.add(
-            &TautClass::new(vec![DecStratum {
+        parts.push(
+            TautClass::new(vec![DecStratum {
                 graph,
                 poly: decsum(1),
             }])
@@ -217,13 +217,13 @@ fn todd_inv_sigma(t: u32, g: u32, n: u32) -> TautClass {
             let mut l2 = comp;
             l2.push(n + 2);
             let graph = StableGraph::new(&[h, g - h], &[l1, l2], &[(n + 1, n + 2)]).unwrap();
-            result = result.add(&TautClass::new(vec![DecStratum {
+            parts.push(TautClass::new(vec![DecStratum {
                 graph,
                 poly: decsum(2),
             }]));
         }
     }
-    degree_part(&result.scale(&divided_bernoulli(t + 1)), t)
+    degree_part(&TautClass::sum(parts).scale(&divided_bernoulli(t + 1)), t)
 }
 
 // ===================== 链图构造 =====================
@@ -295,15 +295,15 @@ fn todd_inv_exp_graphs(a: &[ATriple], t1: u32, tvect: &[u32], g: u32, n: u32) ->
     if !ordered {
         return TautClass::zero();
     }
-    let mut result = TautClass::zero();
-    let push = |result: &mut TautClass,
+    let mut parts: Vec<TautClass> = Vec::new();
+    let push = |parts: &mut Vec<TautClass>,
                 genera: Vec<u32>,
                 labels: Vec<Vec<u32>>,
                 edges: Vec<(u32, u32)>,
                 poly: KP,
                 scale: Q| {
         if let Ok(graph) = StableGraph::new_raw(&genera, &labels, &edges) {
-            *result = result.add(&TautClass::new(vec![DecStratum { graph, poly }]).scale(&scale));
+            parts.push(TautClass::new(vec![DecStratum { graph, poly }]).scale(&scale));
         }
     };
     // 头段 labels/generas（L 顶点链 + 末顶点占位）
@@ -369,7 +369,7 @@ fn todd_inv_exp_graphs(a: &[ATriple], t1: u32, tvect: &[u32], g: u32, n: u32) ->
                     &chain_psi_head(nv, n, &tvn, l),
                     &psi_tail(nv, n + 2 * l as u32 + 1, n + 2 * l as u32 + 2, t1),
                 );
-                push(&mut result, genera, labels, edges, poly, Q::ONE);
+                push(&mut parts, genera, labels, edges, poly, Q::ONE);
             }
             if h == atn[l - 1].0 && s.is_empty() {
                 let genera = head_genera(g - atn[l - 1].0);
@@ -382,7 +382,7 @@ fn todd_inv_exp_graphs(a: &[ATriple], t1: u32, tvect: &[u32], g: u32, n: u32) ->
                 let fin = psi_pow(nv, lp, tvn[l - 1]).scale(&q_powi(-1, tvn[l - 1]));
                 poly = kp_mul(&poly, &fin);
                 poly = kp_mul(&poly, &psi_tail(nv, lp, rp, t1));
-                push(&mut result, genera, labels, edges, poly, Q::ONE);
+                push(&mut parts, genera, labels, edges, poly, Q::ONE);
             }
         }
     }
@@ -397,16 +397,9 @@ fn todd_inv_exp_graphs(a: &[ATriple], t1: u32, tvect: &[u32], g: u32, n: u32) ->
             &chain_psi_head(nv, n, &tvn, l),
             &psi_tail(nv, n + 2 * l as u32 + 1, n + 2 * l as u32 + 2, t1),
         );
-        push(
-            &mut result,
-            genera,
-            labels,
-            edges,
-            poly,
-            Q::ONE / Q::from(2),
-        );
+        push(&mut parts, genera, labels, edges, poly, Q::ONE / Q::from(2));
     }
-    result
+    TautClass::sum(parts)
 }
 
 // ===================== e^C / K / S 合成 =====================
@@ -484,7 +477,7 @@ fn pick_active(a: &[ATriple], tvect: &[u32]) -> (Vec<(u32, Vec<u32>, i64)>, Vec<
 
 /// generalized_hodge_chern_exp(t, a)：e^C 项（末 tvn > 1；最后段指数 tv−1−j−1）。
 fn chern_exp(t: u32, a: &[ATriple], g: u32, n: u32) -> TautClass {
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     for tvect in comps(t + 1, a.len() as u32) {
         let (atn, tvn) = pick_active(a, &tvect);
         let l = atn.len();
@@ -512,11 +505,10 @@ fn chern_exp(t: u32, a: &[ATriple], g: u32, n: u32) -> TautClass {
         let fin = fin.scale(&(q_powi(atn[l - 1].2, tv) * q_powi(-1, tv - 1)));
         poly = kp_mul(&poly, &fin);
         if let Ok(graph) = StableGraph::new_raw(&genera, &labels, &edges) {
-            result = result
-                .add(&TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
+            parts.push(TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
         }
     }
-    result.scale(&(Q::ONE / fact(t + 1)))
+    TautClass::sum(parts).scale(&(Q::ONE / fact(t + 1)))
 }
 
 /// generalized_hodge_chern_Kin(alpha, beta, a)。
@@ -532,7 +524,7 @@ fn chern_kin(alpha: u32, beta: u32, a: &[ATriple], g: u32, n: u32) -> TautClass 
             poly: kp_kappa(0, beta - 1, 1, g, n),
         }]);
     }
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     for tvect in comps(alpha, a.len() as u32) {
         let (atn, tvn) = pick_active(a, &tvect);
         let l = atn.len();
@@ -549,16 +541,15 @@ fn chern_kin(alpha: u32, beta: u32, a: &[ATriple], g: u32, n: u32) -> TautClass 
         let kap = kp_kappa(l, beta - 1, nv, g - atn[l - 1].0, scomp.len() as u32 + 1);
         poly = kp_mul(&poly, &kap);
         if let Ok(graph) = StableGraph::new_raw(&genera, &labels, &edges) {
-            result = result
-                .add(&TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
+            parts.push(TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
         }
     }
-    result
+    TautClass::sum(parts)
 }
 
 /// todd_inv_exp(a, t)：todd⁻¹ 的 e^D 展开（奇 t1 图组 + σ 项）。
 pub fn todd_inv_exp(a: &[ATriple], t: u32, g: u32, n: u32) -> TautClass {
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     let mut t1 = 1;
     while t1 < t {
         let coeff = divided_bernoulli(t1 + 1) / fact(t - t1);
@@ -568,12 +559,12 @@ pub fn todd_inv_exp(a: &[ATriple], t: u32, g: u32, n: u32) -> TautClass {
                 c *= q_powi(ai.2, tvi);
             }
             let graphs = todd_inv_exp_graphs(a, t1, &tvect, g, n);
-            result = result.add(&graphs.scale(&(c * multinomial(&tvect))));
+            parts.push(graphs.scale(&(c * multinomial(&tvect))));
         }
         t1 += 2;
     }
-    result = result.add(&todd_inv_sigma(t, g, n));
-    result
+    parts.push(todd_inv_sigma(t, g, n));
+    TautClass::sum(parts)
 }
 
 /// generalized_hodge_chern_Sin(alpha, beta, p, a)。
@@ -584,7 +575,7 @@ fn chern_sin(alpha: u32, beta: u32, p: u32, a: &[ATriple], g: u32, n: u32) -> Ta
     if alpha == 0 {
         return psi_only(g, n, p, beta - 1, q_powi(-1, beta - 1));
     }
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     for tvect in comps(alpha, a.len() as u32) {
         let (atn, tvn) = pick_active(a, &tvect);
         let l = atn.len();
@@ -608,11 +599,10 @@ fn chern_sin(alpha: u32, beta: u32, p: u32, a: &[ATriple], g: u32, n: u32) -> Ta
             );
         }
         if let Ok(graph) = StableGraph::new_raw(&genera, &labels, &edges) {
-            result = result
-                .add(&TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
+            parts.push(TautClass::new(vec![DecStratum { graph, poly }]).scale(&multinomial(&tvn)));
         }
     }
-    result
+    TautClass::sum(parts)
 }
 
 /// generalized_hodge_chern_single(t, l, d, a)：ch_t = K + S + todd⁻¹e^D，
@@ -634,11 +624,11 @@ pub fn generalized_hodge_chern_single(
     }
     let mut asort: Vec<ATriple> = a.to_vec();
     asort.sort_by(|x, y| x.1.cmp(&y.1).then(x.2.cmp(&y.2)));
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     for alpha in 0..=t + 1 {
         let beta = t + 1 - alpha;
-        result = result.add(
-            &chern_kin(alpha, beta, &asort, g, n)
+        parts.push(
+            chern_kin(alpha, beta, &asort, g, n)
                 .scale(&(divided_bernoulli_poly(l, beta) / fact(alpha))),
         );
     }
@@ -650,12 +640,12 @@ pub fn generalized_hodge_chern_single(
                     * q_powi(d[(p - 1) as usize], beta - b)
                     * divided_bernoulli_poly(l, b)
                     / (fact(alpha) * fact(beta - b));
-                result = result.add(&chern_sin(alpha, beta, p, &asort, g, n).scale(&c));
+                parts.push(chern_sin(alpha, beta, p, &asort, g, n).scale(&c));
             }
         }
     }
-    result = result.add(&todd_inv_exp(&asort, t, g, n));
-    Ok(merge_isomorphic(&degree_part(&result, t)))
+    parts.push(todd_inv_exp(&asort, t, g, n));
+    Ok(merge_isomorphic(&degree_part(&TautClass::sum(parts), t)))
 }
 
 /// twist_div_to_zero(l, d)：使 twist 除子 D = l·K̃ + Σd_iσ_i 拉回到零的
@@ -775,11 +765,11 @@ pub fn generalized_hodge_chern(
     g: u32,
     n: u32,
 ) -> Result<TautClass, String> {
-    let mut result = TautClass::zero();
+    let mut parts: Vec<TautClass> = Vec::new();
     for t in 1..=dmax {
-        result = result.add(&generalized_hodge_chern_single(t, l, d, a, g, n)?);
+        parts.push(generalized_hodge_chern_single(t, l, d, a, g, n)?);
     }
-    Ok(result)
+    Ok(TautClass::sum(parts))
 }
 
 #[cfg(test)]
