@@ -17,7 +17,6 @@
 //! 手验锚点（admcycles 文档值 × 自同构调整后）：DR(1,(2,3,−5)) =
 //! 2ψ₁+9/2ψ₂+25/2ψ₃ −(1/12)[Δ₀] −(25/2)[3|12] −…（我们的 [Δ₀] = 物理轨迹类
 
-use crate::generators::tautgens;
 use crate::kppoly::KappaPsiPolynomial;
 use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
@@ -107,95 +106,102 @@ fn dr_cycle_impl(
     if r as i64 > 3 * g as i64 - 3 + n as i64 {
         return Err("余维超过模空间维数".into());
     }
+    let m0 = (dvector.iter().map(|d| d.abs()).sum::<i64>() + 1) / 2;
     let mut terms: Vec<DecStratum> = Vec::new();
-    for generator in tautgens(g, n, r) {
-        // κ 装饰 → 系数 0（kval = 0）
-        if generator
-            .poly
-            .terms
-            .iter()
-            .any(|t| t.kappa.iter().any(|k| !k.is_empty()))
-        {
-            continue;
-        }
-        let graph = &generator.graph;
-        let t = &generator.poly.terms[0];
-        // 注意：admcycles 的 DR 系数含 1/autom_count（其生成元口径 ξ_*1）；
-        // 我们的 TautClass 口径为 ξ_*/|Aut|（evaluate 时统一除），故此处
-        // 不再放 1/aut，积分结果与 admcycles 直接可比。
-        // 标记部分：d^{2e}/e!
-        let mut scalar = if gen_norm {
-            Q::from_signeds(1, graph.automorphism_number() as i64)
-        } else {
-            Q::ONE
-        };
-        for &(l, e) in &t.psi {
-            if l <= n {
-                let d = dvector[(l - 1) as usize];
-                let mut p = Q::ONE;
-                for _ in 0..2 * e {
-                    p *= Q::from(d);
-                }
-                scalar = scalar * p / fact(e as u64);
-            }
-        }
-        // 结点部分：exp = e1+e2+1，因子 −1/(e1!e2!(e1+e2+1))
-        let nv = graph.vertices().len();
-        let mut edges_v: Vec<(usize, usize)> = Vec::new();
-        let mut exps: Vec<u32> = Vec::new();
-        let leg_vertex = |l: u32| -> usize {
-            graph
-                .vertices()
+    // 含 κ 的生成元系数为 0（kval = 0），只枚举纯 ψ 装饰（顺序与 tautgens
+    // 中 κ 为空的部分一致）。顶点、给定值、圈秩逐图只算一次；Q_Γ(0) 只依赖
+    // 图与各结点的指数，图内按结点指数缓存。
+    for c in 0..=r {
+        for graph in crate::generators::layer(g, n, c).iter() {
+            let verts = graph.vertices();
+            let nv = verts.len();
+            let max_leg = verts
                 .iter()
-                .position(|v| v.legs.contains(&l))
-                .unwrap()
-        };
-        for &(a, b) in graph.edges() {
-            let (va, vb) = (leg_vertex(a), leg_vertex(b));
-            edges_v.push((va, vb));
-            let e1 = t.psi_power_at(a);
-            let e2 = t.psi_power_at(b);
-            let s = e1 + e2 + 1;
-            exps.push(s);
-            scalar = scalar * Q::from(-1) / (fact(e1 as u64) * fact(e2 as u64) * Q::from(s as i64));
-        }
-        // given[v] = Σ_{v 的标记} d
-        let mut given = vec![0i64; nv];
-        for v in graph.vertices() {
-            for &l in &v.legs {
-                if l <= n {
-                    given[leg_vertex(l)] += dvector[(l - 1) as usize];
+                .flat_map(|v| v.legs.iter().copied())
+                .max()
+                .unwrap_or(0) as usize;
+            let mut owner = vec![0usize; max_leg + 1];
+            for (i, v) in verts.iter().enumerate() {
+                for &l in &v.legs {
+                    owner[l as usize] = i;
                 }
             }
-        }
-        // Q(0)：插值
-        let m0 = (dvector.iter().map(|d| d.abs()).sum::<i64>() + 1) / 2;
-        let deg: u32 = 2 * exps.iter().sum::<u32>();
-        let b1 = (graph.edges().len() + 1) as i64 - nv as i64;
-        let mut xs = Vec::new();
-        let mut ys = Vec::new();
-        for m in (m0 + 1)..=(m0 + deg as i64 + 2) {
-            let s = balanced_weight_sum(&edges_v, &exps, &given, m);
-            let mut q = s;
-            for _ in 0..b1.max(0) {
-                q /= Q::from(m);
+            let edges_v: Vec<(usize, usize)> = graph
+                .edges()
+                .iter()
+                .map(|&(a, b)| (owner[a as usize], owner[b as usize]))
+                .collect();
+            // given[v] = Σ_{v 的标记} d
+            let mut given = vec![0i64; nv];
+            for l in 1..=n {
+                given[owner[l as usize]] += dvector[(l - 1) as usize];
             }
-            // b1 ≥ 0（连通图）
-            xs.push(m);
-            ys.push(q);
-        }
-        let q0 = interpolate_at_zero(&xs, &ys);
-        let coeff = scalar * q0 * Q::from_signeds(1, 2i64.pow(r));
-        if !is_zero(&coeff) {
-            // 展开成单项式列表（装饰中 ψ 只在标记与结点半边上）
-            terms.push(DecStratum {
-                graph: graph.clone(),
-                poly: KappaPsiPolynomial::new(vec![crate::kppoly::KpTerm {
-                    kappa: t.kappa.clone(),
-                    psi: t.psi.clone(),
-                    coeff,
-                }]),
-            });
+            let b1 = (graph.edges().len() + 1) as i64 - nv as i64;
+            // 注意：admcycles 的 DR 系数含 1/autom_count（其生成元口径 ξ_*1）；
+            // 我们的 TautClass 口径为 ξ_*/|Aut|（evaluate 时统一除），故此处
+            // 不再放 1/aut，积分结果与 admcycles 直接可比。
+            let aut_scalar = if gen_norm {
+                Q::from_signeds(1, graph.automorphism_number() as i64)
+            } else {
+                Q::ONE
+            };
+            let mut q0_cache: HashMap<Vec<u32>, Q> = HashMap::new();
+            for poly in crate::generators::psi_monomials(graph, r - c) {
+                let t = &poly.terms[0];
+                // 标记部分：d^{2e}/e!
+                let mut scalar = aut_scalar.clone();
+                for &(l, e) in &t.psi {
+                    if l <= n {
+                        let d = dvector[(l - 1) as usize];
+                        let mut p = Q::ONE;
+                        for _ in 0..2 * e {
+                            p *= Q::from(d);
+                        }
+                        scalar = scalar * p / fact(e as u64);
+                    }
+                }
+                // 结点部分：exp = e1+e2+1，因子 −1/(e1!e2!(e1+e2+1))
+                let mut exps: Vec<u32> = Vec::with_capacity(edges_v.len());
+                for &(a, b) in graph.edges() {
+                    let e1 = t.psi_power_at(a);
+                    let e2 = t.psi_power_at(b);
+                    let s = e1 + e2 + 1;
+                    exps.push(s);
+                    scalar = scalar * Q::from(-1)
+                        / (fact(e1 as u64) * fact(e2 as u64) * Q::from(s as i64));
+                }
+                // Q(0)：插值
+                let q0 = q0_cache
+                    .entry(exps.clone())
+                    .or_insert_with(|| {
+                        let deg: u32 = 2 * exps.iter().sum::<u32>();
+                        let mut xs = Vec::new();
+                        let mut ys = Vec::new();
+                        for m in (m0 + 1)..=(m0 + deg as i64 + 2) {
+                            let mut q = balanced_weight_sum(&edges_v, &exps, &given, m);
+                            // b1 ≥ 0（连通图）
+                            for _ in 0..b1.max(0) {
+                                q /= Q::from(m);
+                            }
+                            xs.push(m);
+                            ys.push(q);
+                        }
+                        interpolate_at_zero(&xs, &ys)
+                    })
+                    .clone();
+                let coeff = scalar * q0 * Q::from_signeds(1, 2i64.pow(r));
+                if !is_zero(&coeff) {
+                    // 展开成单项式列表（装饰中 ψ 只在标记与结点半边上）
+                    terms.push(DecStratum {
+                        graph: graph.clone(),
+                        poly: KappaPsiPolynomial::new(vec![crate::kppoly::KpTerm {
+                            kappa: t.kappa.clone(),
+                            psi: t.psi.clone(),
+                            coeff,
+                        }]),
+                    });
+                }
+            }
         }
     }
     Ok(TautClass::new(terms))

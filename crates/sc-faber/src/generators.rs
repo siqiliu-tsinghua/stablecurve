@@ -24,7 +24,7 @@ thread_local! {
 
 /// 余维恰为 codim 的图层：按 (g, n) 逐层缓存，只补算缺失的层。
 /// （原先每次调用都从基本类重推，graphs_upto 因此把第 c 层算 d−c+1 遍。）
-fn layer(g: u32, n: u32, codim: u32) -> Rc<Vec<StableGraph>> {
+pub(crate) fn layer(g: u32, n: u32, codim: u32) -> Rc<Vec<StableGraph>> {
     let cached = LAYERS.with(|m| m.borrow().get(&(g, n)).cloned().unwrap_or_default());
     if let Some(l) = cached.get(codim as usize) {
         return l.clone();
@@ -168,6 +168,30 @@ pub fn tautgens(g: u32, n: u32, d: u32) -> Vec<DecStratum> {
             }
         }
     }
+    out
+}
+
+/// 图 gr 上总权重 w、不带 κ 的全部 ψ 单项式——即 [`monomials`] 中 κ 为空的
+/// 那一部分，顺序一致（DR 的 Pixton 公式里含 κ 的生成元系数为 0）。
+pub(crate) fn psi_monomials(gr: &StableGraph, w: u32) -> Vec<KappaPsiPolynomial> {
+    let nv = gr.vertices().len();
+    let mut all_legs: Vec<Leg> = gr
+        .vertices()
+        .iter()
+        .flat_map(|v| v.legs.iter().copied())
+        .collect();
+    all_legs.sort_unstable();
+    let mut out = Vec::new();
+    enum_psi(&all_legs, 0, w, &mut vec![], &mut |psi| {
+        let poly = KappaPsiPolynomial::new(vec![KpTerm {
+            kappa: vec![vec![]; nv],
+            psi: psi.to_vec(),
+            coeff: Q::ONE,
+        }]);
+        if poly.weight() == Some(w) {
+            out.push(poly);
+        }
+    });
     out
 }
 
