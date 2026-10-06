@@ -1,0 +1,24 @@
+[package]
+name = "sc-gwall-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "sc-gwall 的 pyo3 绑定：import sc_gwall"
+
+[lib]
+name = "_sc_gwall"
+crate-type = ["cdylib"]
+
+[dependencies]
+sc-gwall = { path = "../sc-gwall", version = "0.1.0" }
+sc-num = { path = "../sc-num", version = "0.1.0" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
+
+[build-dependencies]
+pyo3-build-config = "0.25"
+
+[lints]
+workspace = true

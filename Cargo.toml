@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+repository = "https://github.com/siqiliu-tsinghua/stablecurve"
+
+[workspace.lints.clippy]
+# 移植代码的递归过程逐一对应原版（Maple/C++）过程的签名：参数多、记忆化键为
+# 嵌套元组。为迎合这两条风格 lint 重构已验证的数值代码得不偿失。
+too_many_arguments = "allow"
+type_complexity = "allow"

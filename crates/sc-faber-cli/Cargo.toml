@@ -1,0 +1,20 @@
+[package]
+name = "sc-faber-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "sc-faber 引擎二进制 faber（JSONL 批处理）"
+
+[dependencies]
+sc-faber = { path = "../sc-faber", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "faber"
+path = "src/main.rs"
+
+[lints]
+workspace = true

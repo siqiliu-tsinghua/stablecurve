@@ -1,0 +1,15 @@
+[package]
+name = "sc-growi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Gromov-Witten 不变量计算引擎（GROWI 的现代 Rust 重实现，核心库）"
+
+[dependencies]
+sc-num = { path = "../sc-num", version = "0.1.0" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[lints]
+workspace = true

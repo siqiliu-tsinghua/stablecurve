@@ -1,0 +1,23 @@
+[package]
+name = "sc-growi-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "sc-growi 的 pyo3 绑定：import sc_growi"
+
+[lib]
+name = "_sc_growi"
+crate-type = ["cdylib"]
+
+[dependencies]
+sc-growi = { path = "../sc-growi", version = "0.1.0" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
+
+[build-dependencies]
+pyo3-build-config = "0.25"
+
+[lints]
+workspace = true

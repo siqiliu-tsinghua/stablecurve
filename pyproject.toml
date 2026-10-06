@@ -1,0 +1,29 @@
+[project]
+name = "stablecurve"
+version = "0.1.0"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+dependencies = ["sc-growi", "sc-faber", "sc-gwall"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.15.0",
+    "pytest>=9.1.1",
+]
+
+# 根目录是虚拟工作区：三个 Python 扩展各自是 crates/sc-*-py 下的 maturin 项目，
+# `uv sync` 以可编辑方式构建并安装全部三个。
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["crates/sc-growi-py", "crates/sc-faber-py", "crates/sc-gwall-py"]
+
+[tool.uv.sources]
+sc-growi = { workspace = true }
+sc-faber = { workspace = true }
+sc-gwall = { workspace = true }
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=.pytest_tmp"
+testpaths = ["tests"]

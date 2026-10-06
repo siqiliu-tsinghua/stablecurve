@@ -1,0 +1,15 @@
+[package]
+name = "sc-num"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "有理数后端（malachite Q 包装，sc 系 crate 共用）"
+
+[dependencies]
+malachite-base = "0.6"
+malachite-q = "0.6"
+
+[lints]
+workspace = true

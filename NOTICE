@@ -1,0 +1,50 @@
+stablecurve
+Copyright (C) 2026 Si-Qi Liu
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. See the file LICENSE.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.
+
+
+Upstream works
+==============
+
+Parts of this program are modified versions (translations to Rust,
+restructured and extended, October 2026) of the following works:
+
+* GROWI 1.0.4, by Andreas Gathmann, distributed under the GNU General
+  Public License. https://personal.math.uni-sb.de/~agathmann/growi/
+  -> crates/sc-growi (translation of the C++ sources: libgw/, math/, and
+     the expression syntax of cm/expr.cc)
+
+* admcycles, by Aaron Pixton, Johannes Schmitt, Vincent Delecroix, Jason
+  van Zelm, Jonathan Zachhuber and Johannes Schwab, distributed under the
+  GNU General Public License, version 2 or later.
+  https://gitlab.com/modulispaces/admcycles
+  -> crates/sc-faber (graph.rs, kppoly.rs, taut.rs, generators.rs, socle.rs,
+     dr.rs, classes.rs, witten.rs, grr.rs follow the corresponding admcycles
+     modules)
+
+The following research programs, distributed publicly by their authors
+without an explicit license, were ported to Rust (the algorithms and the
+structure of the procedures follow the originals). They were obtained from
+the public distribution pages below and are credited here, following
+academic practice, as the source of those parts of this program:
+
+* Carel Faber, "Numbers" (Maple, 2001-2004), distributed via R. Vakil's
+  program page. https://math.stanford.edu/~vakil/programs/Numbers.tar
+  -> crates/sc-faber (tau.rs, push.rs, hodge.rs: the procedures tau,
+     pushn/push, klp/klmgn and lamb)
+
+* Jim Bryan, "GWall" (Maple, 2002), distributed on the author's homepage.
+  https://personal.math.ubc.ca/~jbryan/gwall.html
+  -> crates/sc-gwall (comb.rs, gwpoint.rs, gwloop.rs, gwl.rs, and the
+     branch/Ztil/Z/Y layer of pf.rs)
+  The BPS inversion in pf.rs follows J. Bryan, R. Pandharipande, "BPS
+  states of curves in Calabi-Yau 3-folds", Geom. Topol. 5 (2001) 287-318,
+  arXiv:math/0009025.

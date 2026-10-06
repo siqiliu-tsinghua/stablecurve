@@ -1,0 +1,22 @@
+# 参考资料与原始源码（原版 GROWI，重做对照用）
+/refs/
+
+# Rust 构建产物
+/target/
+
+# Python 虚拟环境与缓存
+/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地数据库缓存（两级缓存的 L2 落盘文件）
+*.sqlite
+*.sqlite-*
+.pytest_tmp/
+
+# 编译出的 Python 扩展模块（由 maturin / `uv sync` 生成，不入库）
+*.pyd
+*.pdb
+*.so
+*.dylib

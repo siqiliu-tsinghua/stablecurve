@@ -1,0 +1,23 @@
+[package]
+name = "sc-faber-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "sc-faber 的 pyo3 绑定：import sc_faber"
+
+[lib]
+name = "_sc_faber"
+crate-type = ["cdylib"]
+
+[dependencies]
+faber = { path = "../sc-faber", version = "0.1.0", package = "sc-faber" }
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
+
+[build-dependencies]
+pyo3-build-config = "0.25"
+
+[lints]
+workspace = true
