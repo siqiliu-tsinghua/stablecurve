@@ -208,7 +208,8 @@ fn dr_cycle_impl(
 }
 
 /// ∫_{M̄_{g,n}} DR · X，X 为基本类上的 κ-ψ 单项式。
-/// 限制公式：κ_j|_Γ = Σ_v κ_j^{(v)} + Σ_{结点半边 h} ψ_h^j；ψ_i|_Γ = ψ_i（其顶点）。
+/// 限制公式（Arbarello–Cornalba 的 κ，结点半边在各顶点上算作标记）：
+/// κ_j|_Γ = Σ_v κ_j^{(v)}；ψ_i|_Γ = ψ_i（其顶点）。求值见 classes::int_against。
 pub fn int_dr(
     g: u32,
     dvector: &[i64],
