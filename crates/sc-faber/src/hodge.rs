@@ -541,10 +541,10 @@ mod tests {
         assert!(e3.contains(&(vec![(1, 3)], Q::from_signeds(1, 6))));
     }
 
-    /// 重型 λ 例子（g=5..7；Faber 本人在 2004 服务器上 g=7 需 35s）。
-    /// 运行：cargo test --release -p sc-faber -- --ignored
+    /// 较重的 λ 例子（g=5..8；Faber 本人在 2004 服务器上 g=7 需 35s）。
+    /// socle 分裂项与 push 的 κ 展开按多重集枚举后，g=8 也只需不到一秒
+    /// （此前分别为指数级，g=7/8 约 2.5s/29s，故曾标 ignore）。
     #[test]
-    #[ignore]
     fn instructions_heavy() {
         assert_eq!(
             klp(5, 0, &[], &[], &[(1, 12)], &[]).unwrap(),
@@ -557,6 +557,11 @@ mod tests {
         assert_eq!(
             klp(7, 0, &[], &[], &[(1, 18)], &[]).unwrap(),
             Q::from_signeds(32017001, 638512875)
+        );
+        // g=8：与 DLYZ Hodge 势 H_8 的提取值、admcycles 的 Schmitt–Sun 数据一致
+        assert_eq!(
+            klp(8, 0, &[], &[], &[(1, 21)], &[]).unwrap(),
+            Q::from_signeds(38176003213i64, 5746615875)
         );
     }
 

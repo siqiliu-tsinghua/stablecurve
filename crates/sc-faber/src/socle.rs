@@ -331,38 +331,55 @@ fn st_recur_calc(psi: &[u32]) -> Q {
     let mut p2 = vec![0u32; 3];
     p2.extend_from_slice(psi);
     total -= Q::from_signeds(2 * g + n - 1, 6) * st_recur(&p2);
-    // 分离分裂项：I ⊆ {0..n−2}
-    for mask in 0u64..(1u64 << (n - 1)) {
-        let idx: Vec<usize> = (0..(n - 1) as usize)
-            .filter(|i| mask & (1 << i) != 0)
-            .collect();
-        let n_i = idx.len() as i64 + 2;
-        let deg_i: i64 = idx.iter().map(|&i| psi[i] as i64).sum();
-        if (deg_i - n_i) % 3 != 0 {
-            continue;
+    // 分离分裂项：I ⊆ {0..n−2}。各项只依赖 I 与补集的多重集，故按多重集
+    // 枚举：值 v 在前 n−1 个指标中出现 m 次，取其中 c 个进 I，权重 ∏C(m,c)。
+    // 代价 ∏(m+1)，而非 2^{n−1}（如 ∫κ₁^{3g−3} 的叶子 [2;3g−3]）。
+    let mut vals: Vec<u32> = Vec::new();
+    let mut mult: Vec<u32> = Vec::new();
+    for &x in &psi[..(n - 1) as usize] {
+        if vals.last() == Some(&x) {
+            *mult.last_mut().unwrap() += 1;
+        } else {
+            vals.push(x);
+            mult.push(1);
         }
-        let g_i = (deg_i - n_i) / 3 + 1;
-        if 2 * g_i - 2 + n_i <= 0 {
-            continue;
+    }
+    let mut take = vec![0u32; vals.len()];
+    loop {
+        let n_i = take.iter().sum::<u32>() as i64 + 2;
+        let deg_i: i64 = vals.iter().zip(&take).map(|(&v, &c)| (v * c) as i64).sum();
+        if (deg_i - n_i) % 3 == 0 && 2 * ((deg_i - n_i) / 3 + 1) - 2 + n_i > 0 {
+            let mut psi3 = vec![0u32; 2];
+            let mut psi1 = vec![0u32; 2];
+            let mut weight = Q::ONE;
+            for ((&v, &m), &c) in vals.iter().zip(&mult).zip(&take) {
+                psi3.extend(std::iter::repeat_n(v, c as usize));
+                psi1.extend(std::iter::repeat_n(v, (m - c) as usize));
+                weight *= binom(m as u64, c as u64);
+            }
+            let x = st_recur(&psi3);
+            // x = 0 时贡献为 0（admcycles 此处 raise），跳过
+            if !is_zero(&x) {
+                psi1.push(d as u32 + 1);
+                let mut psi2 = psi1[1..].to_vec();
+                let l2 = psi2.len() - 1;
+                psi2[l2] = d as u32;
+                total += (Q::from(2 * d + 3) * st_recur(&psi1)
+                    - Q::from(2 * g + n - 1) * st_recur(&psi2))
+                    * x
+                    * weight;
+            }
         }
-        let mut psi3 = vec![0u32; 2];
-        psi3.extend(idx.iter().map(|&i| psi[i]));
-        let x = st_recur(&psi3);
-        if is_zero(&x) {
-            continue; // admcycles 此处 raise；贡献为 0，跳过
+        // 计数向量的里程表式递增
+        let mut j = 0;
+        while j < take.len() && take[j] == mult[j] {
+            take[j] = 0;
+            j += 1;
         }
-        let mut psi1 = vec![0u32; 2];
-        psi1.extend(
-            (0..(n - 1) as usize)
-                .filter(|i| !idx.contains(i))
-                .map(|i| psi[i]),
-        );
-        psi1.push(d as u32 + 1);
-        let mut psi2 = psi1[1..].to_vec();
-        let l2 = psi2.len() - 1;
-        psi2[l2] = d as u32;
-        total +=
-            (Q::from(2 * d + 3) * st_recur(&psi1) - Q::from(2 * g + n - 1) * st_recur(&psi2)) * x;
+        if j == take.len() {
+            break;
+        }
+        take[j] += 1;
     }
     total /= Q::from((2 * g + n - 1) * (2 * g + n - 2));
     total
@@ -550,6 +567,25 @@ mod tests {
         assert_eq!(st_recur(&[2, 2, 2]), Q::from_signeds(7, 240));
         assert_eq!(st_recur(&[2; 6]), Q::from_signeds(1225, 144));
         assert_eq!(st_recur(&[1, 1, 1]), Q::from_signeds(1, 12));
+    }
+
+    /// 回归：分裂项按多重集枚举（重复指数带二项式权重）须与 dilaton 闭式一致。
+    #[test]
+    fn st_recur_repeated_entries() {
+        // ⟨τ₁ⁿ⟩₁ = (n−1)!/24
+        for n in 1..=16usize {
+            assert_eq!(
+                st_recur(&vec![1; n]),
+                fact(n as u64 - 1) / Q::from(24),
+                "n={n}"
+            );
+        }
+        // ⟨τ₁ᵏτ₄⟩₂ = (k+2)!/2 · ⟨τ₄⟩₂ = (k+2)!/2304
+        for k in 0..=16usize {
+            let mut p = vec![1; k];
+            p.push(4);
+            assert_eq!(st_recur(&p), fact(k as u64 + 2) / Q::from(2304), "k={k}");
+        }
     }
 
     #[test]

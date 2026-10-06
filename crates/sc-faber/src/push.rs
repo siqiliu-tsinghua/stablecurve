@@ -35,22 +35,30 @@ fn check_fund(g: u32, n: u32, p: &KappaPsiPolynomial) -> Result<(), String> {
 }
 
 /// 把单项式的 κ 分划的每个因子独立地展开为 κ 或 ψ_n^幂。
+/// 相同指标按重数合并：κ_i^e → Σ_k C(e,k)·κ_i^{e−k}·ψ_n^{ik}，
+/// 项数 ∏(e+1)，而非 2^{分划长度}。
 fn expand_kappa_psi_n(term: &KpTerm, n: u32, out: &mut Vec<KpTerm>) {
     let part = term.kappa.first().cloned().unwrap_or_default();
-    // 递归：对 part 的每个位置决定留给 κ 还是转成 ψ_n^index
+    let mut groups: Vec<(u32, u32)> = Vec::new();
+    for &i in &part {
+        match groups.last_mut() {
+            Some(e) if e.0 == i => e.1 += 1,
+            _ => groups.push((i, 1)),
+        }
+    }
+    // 递归：对每个 (指标, 重数) 决定有几个因子转成 ψ_n^指标
     fn rec(
         term_coeff: &Q,
         psi: &[(u32, u32)],
-        part: &[u32],
+        groups: &[(u32, u32)],
         i: usize,
         keep: &mut Vec<u32>,
         psi_n_pow: u32,
         n: u32,
         out: &mut Vec<KpTerm>,
     ) {
-        if i == part.len() {
-            let mut kappa = vec![keep.clone()];
-            kappa.sort_unstable();
+        if i == groups.len() {
+            let kappa = vec![keep.clone()];
             let mut psi = psi.to_vec();
             if psi_n_pow > 0 {
                 // 同腿幂必须合并（否则 psi_power_at 误读分支）
@@ -68,23 +76,28 @@ fn expand_kappa_psi_n(term: &KpTerm, n: u32, out: &mut Vec<KpTerm>) {
             });
             return;
         }
-        // 留作 κ
-        keep.push(part[i]);
-        rec(term_coeff, psi, part, i + 1, keep, psi_n_pow, n, out);
-        keep.pop();
-        // 转成 ψ_n^{part[i]}
-        rec(
-            term_coeff,
-            psi,
-            part,
-            i + 1,
-            keep,
-            psi_n_pow + part[i],
-            n,
-            out,
-        );
+        let (idx, e) = groups[i];
+        let mut binom = Q::from(1);
+        for k in 0..=e {
+            // 留 e−k 个 κ_idx，转 k 个为 ψ_n^idx
+            let kept = keep.len();
+            keep.extend(std::iter::repeat_n(idx, (e - k) as usize));
+            let c = term_coeff * &binom;
+            rec(&c, psi, groups, i + 1, keep, psi_n_pow + idx * k, n, out);
+            keep.truncate(kept);
+            binom = binom * Q::from(e - k) / Q::from(k + 1);
+        }
     }
-    rec(&term.coeff, &term.psi, &part, 0, &mut Vec::new(), 0, n, out);
+    rec(
+        &term.coeff,
+        &term.psi,
+        &groups,
+        0,
+        &mut Vec::new(),
+        0,
+        n,
+        out,
+    );
 }
 
 /// 遗忘第 n 个标记的前推（见模块注释）。
@@ -270,5 +283,45 @@ mod tests {
         assert_eq!(int0(5, &(&kpw(1, 1) * &psw(1, 1))), Q::from(3));
         // 超度 → 0：κ_1 在 M̄_{0,3}（点）上
         assert_eq!(int0(3, &kpw(1, 1)), Q::ZERO);
+    }
+
+    /// socle 求值（κ 乘积带集合分划修正；过权项记 0）。
+    fn int_socle(g: u32, n: u32, p: &KP) -> Q {
+        use crate::graph::StableGraph;
+        use crate::taut::{DecStratum, TautClass};
+        let legs: Vec<u32> = (1..=n).collect();
+        let graph = StableGraph::new(&[g], &[legs], &[]).unwrap();
+        TautClass::new(vec![DecStratum {
+            graph,
+            poly: p.clone(),
+        }])
+        .evaluate()
+        .unwrap()
+    }
+
+    #[test]
+    fn pushn_repeated_kappa_indices() {
+        // 回归：κ_i^e 按重数展开（二项式权重）后，∫ 恒等式须保持
+        // WP 锚点：∫_{0,5}κ₁² = 5，∫_{0,6}κ₁³ = 61，∫_{0,7}κ₁⁴ = 1379
+        assert_eq!(int_socle(0, 5, &kpw(1, 2)), Q::from(5));
+        assert_eq!(int_socle(0, 6, &kpw(1, 3)), Q::from(61));
+        assert_eq!(int_socle(0, 7, &kpw(1, 4)), Q::from(1379));
+        // (0,7) 顶权 4；(0,8) 顶权 5
+        let cases: Vec<(u32, KP)> = vec![
+            (7, kpw(1, 4)),
+            (7, &kpw(1, 2) * &kpw(2, 1)),
+            (7, &kpw(1, 3) * &psw(1, 1)),
+            (7, &(&kpw(1, 2) * &psw(1, 1)) * &psw(7, 1)),
+            (7, &kpw(2, 2) + &(&kpw(1, 2) * &psw(7, 2))),
+            (8, &(&kpw(1, 3) * &kpw(2, 1)) + &(&kpw(1, 2) * &psw(8, 3))),
+        ];
+        for (n, p) in &cases {
+            let q = pushn(0, *n, p).unwrap();
+            assert_eq!(
+                int_socle(0, *n, p),
+                int_socle(0, n - 1, &q),
+                "n={n} p={p:?}"
+            );
+        }
     }
 }
