@@ -104,53 +104,77 @@ pub fn int_against(
     kappa: &[(u32, u32)],
     psi: &[(u32, u32)],
 ) -> Result<sc_num::Q, String> {
-    use sc_num::Zero;
     if let Some(t) = cl.terms.first() {
         crate::kppoly::check_marking_legs(psi, t.graph.num_markings())?;
     }
-    let mut total = sc_num::Q::ZERO;
+    // X 的 κ 因子按指标合并：κ_j^p 的 p 个因子拆到各顶点的方式按重数计
+    // （多项式系数），不逐因子独立分配（nv^{因子数} 项）
+    let mut kgroups: Vec<(u32, u32)> = Vec::new();
+    for &(j, p) in kappa {
+        match kgroups.iter_mut().find(|e| e.0 == j) {
+            Some(e) => e.1 += p,
+            None if p > 0 => kgroups.push((j, p)),
+            None => {}
+        }
+    }
+    let mut total = Q::ZERO;
     for t in &cl.terms {
-        let graph = &t.graph;
-        let nv = graph.vertices().len();
+        let verts = t.graph.vertices();
+        let nv = verts.len();
+        let aut_inv = Q::from_signeds(1, t.graph.automorphism_number() as i64);
+        let dists = kappa_distributions(&kgroups, nv);
         for term in &t.poly.terms {
-            let factors: Vec<u32> = kappa
+            // 与 TautClass::evaluate 同一求值：同腿 ψ 合并，逐顶点 socle，
+            // 顶点度数不符记 0，整体除以 |Aut|
+            let mut xpsi = term.psi.clone();
+            xpsi.extend_from_slice(psi);
+            let xpsi = crate::kppoly::merge_psi(&xpsi);
+            let power_at = |l: u32| xpsi.iter().find(|e| e.0 == l).map_or(0, |e| e.1);
+            let psilists: Vec<Vec<u32>> = verts
                 .iter()
-                .flat_map(|&(j, p)| vec![j; p as usize])
+                .map(|v| v.legs.iter().map(|&l| power_at(l)).collect())
                 .collect();
-            let ncomb = nv.pow(factors.len() as u32);
-            for comb in 0..ncomb {
-                // 原类项自身的 κ 逐顶点保留，X 的 κ 因子再分配到顶点
-                let mut kverts: Vec<Vec<u32>> = term.kappa.clone();
-                kverts.resize(nv, Vec::new());
-                let mut c = comb;
-                for &j in &factors {
-                    kverts[c % nv].push(j);
-                    c /= nv;
-                }
-                let mut xpsi = term.psi.clone();
-                for &(l, p) in psi {
-                    if let Some(e) = xpsi.iter_mut().find(|e| e.0 == l) {
-                        e.1 += p;
-                    } else {
-                        xpsi.push((l, p));
+            for (add, weight) in &dists {
+                let mut v = &term.coeff * &aut_inv * weight;
+                for (vi, vtx) in verts.iter().enumerate() {
+                    let mut kl: Vec<u32> = term.kappa.get(vi).cloned().unwrap_or_default();
+                    kl.extend_from_slice(&add[vi]);
+                    let dim = 3 * vtx.genus as i64 - 3 + vtx.legs.len() as i64;
+                    let deg: i64 = psilists[vi].iter().map(|&x| x as i64).sum::<i64>()
+                        + kl.iter().map(|&x| x as i64).sum::<i64>();
+                    if deg != dim {
+                        v = Q::ZERO;
+                        break;
                     }
+                    v *= crate::socle::socle_formula(vtx.genus, &psilists[vi], &kl)?;
                 }
-                xpsi.retain(|&(_, p)| p > 0);
-                xpsi.sort_unstable();
-                let poly = KP::new(vec![KpTerm {
-                    kappa: kverts,
-                    psi: xpsi,
-                    coeff: term.coeff.clone(),
-                }]);
-                let sub = TautClass::new(vec![DecStratum {
-                    graph: graph.clone(),
-                    poly,
-                }]);
-                total += sub.evaluate()?;
+                total += v;
             }
         }
     }
     Ok(total)
+}
+
+/// X 的 κ 因子（按指标合并的 (j, p)）分到 nv 个顶点的全部方式：每个指标的
+/// 重数拆成 nv 份（弱组合），权重为多项式系数 p!/Π c_v!。
+fn kappa_distributions(groups: &[(u32, u32)], nv: usize) -> Vec<(Vec<Vec<u32>>, Q)> {
+    let mut out: Vec<(Vec<Vec<u32>>, Q)> = vec![(vec![Vec::new(); nv], Q::ONE)];
+    for &(j, p) in groups {
+        let mut next = Vec::new();
+        for (base, w) in &out {
+            for comp in comps(p, nv as u32) {
+                let mut add = base.clone();
+                let mut weight = w * fact_u32(p);
+                for (vi, &c) in comp.iter().enumerate() {
+                    add[vi].extend(std::iter::repeat_n(j, c as usize));
+                    weight /= fact_u32(c);
+                }
+                next.push((add, weight));
+            }
+        }
+        out = next;
+    }
+    out
 }
 
 #[cfg(test)]
