@@ -6,13 +6,14 @@
 //! 两实现互为内建差分（原版即双实现）：
 //!
 //! - [`gwloop`]：全 S_m 置换和（慢参考版，GWall `GWloop`）
-//! - [`fast_gwloop`]：按环路指标分组 + 组内重复剪枝（GWall `fastGWloop`）
+//! - [`fast_gwloop`]：行列式化——对每个分拆 λ，置换和是一个 m×m 行列式
+//!   （GWall `fastGWloop` 按环路指标分组枚举组内置换，仍是阶乘级）
 //!
 //! 符号统一用 (−1)^{m(m−1)/2}·parity(σ)（原版 evils 的魔数依赖 Maple
 //! permute 枚举顺序且作者自注仅 m<9 有效——弃用，见 comb::parity）。
 
-use crate::comb::{CartProd, parity, permute};
-use crate::gwpoint::gwpoint;
+use crate::comb::{parity, permute};
+use crate::gwpoint::{gwpoint, partition_weights, tau_factor};
 use sc_num::{One, Q, Zero};
 
 /// 环路插入 τ_k(a_idx) / τ_k(b_idx)（idx ∈ 1..=g）。
@@ -79,7 +80,13 @@ pub fn gwloop(g: u32, d: u32, tau_point: &[u32], ta: &[LoopIns], tb: &[LoopIns])
     answer
 }
 
-/// 快版：按环路指标分组，组内枚举置换（组间独立）；组内后代重复 → 0。
+/// 快版：行列式化。gwpoint 对每个分拆 λ 关于 τ 是乘性的，
+///   ⟨Π τ_k(pt)⟩ = Σ_λ w(λ)·Π_k f_λ(k)，
+/// 故置换和 Σ_σ sgn σ·Π_i binom·cup·⟨…⟩ = Σ_λ w(λ)·Π_{τ_point} f_λ·det M_λ，
+///   M_λ[i][j] = C(x_i+y_j, x_i)·[α_i = β_j]·f_λ(x_i+y_j−1)（x_i+y_j = 0 时为 0）。
+/// 行（a 侧）、列（b 侧）各按环路指标稳定排序后 M_λ 为块对角，det 等于两个
+/// 重排的符号乘各块行列式之积。大小为 1 的块直接取元素（常见情形，与按组
+/// 枚举置换同价），同指标多次出现的块做 O(k³) 消元而非 k! 项置换和。
 pub fn fast_gwloop(g: u32, d: u32, tau_point: &[u32], ta: &[LoopIns], tb: &[LoopIns]) -> Q {
     let m = ta.len();
     if m != tb.len() {
@@ -91,70 +98,112 @@ pub fn fast_gwloop(g: u32, d: u32, tau_point: &[u32], ta: &[LoopIns], tb: &[Loop
     if m == 0 {
         return gwpoint(g, d, tau_point);
     }
-    // 分组（头插语义不影响结果：GWpoint 对 τ 乘性对称）
-    let mut alist: Vec<Vec<u32>> = vec![Vec::new(); g as usize + 1];
-    let mut blist: Vec<Vec<u32>> = vec![Vec::new(); g as usize + 1];
-    let mut reordersign: i64 = 0; // 累计指数（模 2）
-    for i in 0..m {
-        let (ca, cb) = (ta[i].idx as usize, tb[i].idx as usize);
-        let mut expo = 0i64;
-        expo += alist[ca..].iter().map(|v| v.len() as i64).sum::<i64>();
-        expo += blist[cb..].iter().map(|v| v.len() as i64).sum::<i64>();
-        reordersign += expo;
-        alist[ca].push(ta[i].tau);
-        blist[cb].push(tb[i].tau);
+    let mut rows: Vec<usize> = (0..m).collect();
+    rows.sort_by_key(|&i| ta[i].idx);
+    let mut cols: Vec<usize> = (0..m).collect();
+    cols.sort_by_key(|&j| tb[j].idx);
+    // a/b 分组大小不对称 → cup 矩阵奇异 → 不变量为零
+    if rows
+        .iter()
+        .map(|&i| ta[i].idx)
+        .ne(cols.iter().map(|&j| tb[j].idx))
+    {
+        return Q::ZERO;
     }
-    // a/b 分组大小不对称 → cup 全零 → 不变量为零
-    for i in 1..=g as usize {
-        if alist[i].len() != blist[i].len() {
+    // 同组块（排序后位置区间）；组内后代重复 → 两行（列）相同 → 外代数消没
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut s = 0;
+    while s < m {
+        let mut e = s + 1;
+        while e < m && ta[rows[e]].idx == ta[rows[s]].idx {
+            e += 1;
+        }
+        let distinct = |taus: Vec<u32>| {
+            let mut t = taus;
+            t.sort_unstable();
+            t.windows(2).all(|w| w[0] != w[1])
+        };
+        if !distinct(rows[s..e].iter().map(|&i| ta[i].tau).collect())
+            || !distinct(cols[s..e].iter().map(|&j| tb[j].tau).collect())
+        {
             return Q::ZERO;
         }
+        blocks.push((s, e));
+        s = e;
     }
-    // 组内重复后代 → 外代数消没
-    for i in 1..=g as usize {
-        let mut sa = alist[i].clone();
-        sa.sort_unstable();
-        sa.dedup();
-        if sa.len() != alist[i].len() {
-            return Q::ZERO;
+    let sign = perm_sign(&rows) * perm_sign(&cols);
+    let entry = |part: &[u32], i: usize, j: usize| -> Q {
+        let (x, y) = (ta[i].tau, tb[j].tau);
+        if x + y == 0 {
+            Q::ZERO // 后代数 −1：负指标 → 零
+        } else {
+            binom(x + y, x) * tau_factor(part, x + y - 1)
         }
-        let mut sb = blist[i].clone();
-        sb.sort_unstable();
-        sb.dedup();
-        if sb.len() != blist[i].len() {
-            return Q::ZERO;
-        }
-    }
-    // 各组置换的笛卡尔积
-    let perms: Vec<Vec<Vec<u32>>> = (1..=g as usize)
-        .map(|i| permute(alist[i].len() as u32))
-        .collect();
+    };
     let mut answer = Q::ZERO;
-    for sig in CartProd::new(&perms) {
-        let mut evil_par: i64 = 1; // Π 组奇偶
-        let mut new_tau: Vec<u32> = tau_point.to_vec();
-        let mut bin = Q::ONE;
-        for i in 1..=g as usize {
-            let p = &perms[i - 1][sig[i - 1]];
-            if parity(p) < 0 {
-                evil_par = -evil_par;
-            }
-            for k in 0..alist[i].len() {
-                let x = alist[i][k];
-                let y = blist[i][p[k] as usize - 1];
-                bin *= binom(x + y, x);
-                if x + y == 0 {
-                    bin = Q::ZERO;
-                    break;
-                }
-                new_tau.push(x + y - 1);
-            }
+    'part: for (w, part) in partition_weights(g, d) {
+        let mut prod = w;
+        for &k in tau_point {
+            prod *= tau_factor(&part, k);
         }
-        if bin != Q::ZERO {
-            answer += bin * Q::from(evil_par) * gwpoint(g, d, &new_tau);
+        for &(s, e) in &blocks {
+            let dv = if e - s == 1 {
+                entry(&part, rows[s], cols[s])
+            } else {
+                det(rows[s..e]
+                    .iter()
+                    .map(|&i| cols[s..e].iter().map(|&j| entry(&part, i, j)).collect())
+                    .collect())
+            };
+            if dv == Q::ZERO {
+                continue 'part;
+            }
+            prod *= dv;
+        }
+        answer += prod;
+    }
+    answer * Q::from(sign) * q_pow_neg1(m as i64 * (m as i64 - 1) / 2)
+}
+
+/// 排列 p（p[k] = 位置 k 上的原下标）的符号。
+fn perm_sign(p: &[usize]) -> i64 {
+    let mut inv = 0usize;
+    for i in 0..p.len() {
+        for j in i + 1..p.len() {
+            if p[i] > p[j] {
+                inv += 1;
+            }
         }
     }
-    answer * q_pow_neg1(m as i64 * (m as i64 - 1) / 2 + reordersign)
+    if inv % 2 == 0 { 1 } else { -1 }
+}
+
+/// 有理方阵的行列式（高斯消元，选非零主元）。
+fn det(mut a: Vec<Vec<Q>>) -> Q {
+    let n = a.len();
+    let mut det = Q::ONE;
+    for c in 0..n {
+        let Some(p) = (c..n).find(|&r| a[r][c] != Q::ZERO) else {
+            return Q::ZERO;
+        };
+        if p != c {
+            a.swap(p, c);
+            det = -det;
+        }
+        let (top, rest) = a.split_at_mut(c + 1);
+        let pivot = &top[c];
+        det *= &pivot[c];
+        for row in rest.iter_mut() {
+            if row[c] == Q::ZERO {
+                continue;
+            }
+            let f = &row[c] / &pivot[c];
+            for k in c..n {
+                row[k] -= &f * &pivot[k];
+            }
+        }
+    }
+    det
 }
 
 #[cfg(test)]
@@ -237,5 +286,42 @@ mod tests {
             fast_gwloop(3, 1, &[0], &ta, &tb).to_string(),
             direct.to_string()
         );
+    }
+
+    /// 行列式版对照慢参考版：m = 3、4，指标与后代次数混合（含同组重复后代、
+    /// a/b 分组不对称、x+y = 0 的负后代）。
+    #[test]
+    fn determinant_vs_permutation_sum() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = |k: u32| -> u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % k as u64) as u32
+        };
+        let mut nonzero = 0;
+        for _ in 0..300 {
+            let g = 2 + rnd(3);
+            let d = 1 + rnd(3);
+            let m = 3 + rnd(2) as usize;
+            let ta: Vec<LoopIns> = (0..m).map(|_| li(rnd(6), 1 + rnd(g))).collect();
+            // b 侧指标多数取 a 侧指标的随机排列（分组对上才可能非零），少数随机
+            let mut idx: Vec<u32> = ta.iter().map(|t| t.idx).collect();
+            for i in (1..m).rev() {
+                idx.swap(i, rnd(i as u32 + 1) as usize);
+            }
+            if rnd(4) == 0 {
+                idx[0] = 1 + rnd(g);
+            }
+            let tb: Vec<LoopIns> = idx.iter().map(|&i| li(rnd(6), i)).collect();
+            let tp: Vec<u32> = (0..rnd(3)).map(|_| rnd(3)).collect();
+            let a = gwloop(g, d, &tp, &ta, &tb);
+            let b = fast_gwloop(g, d, &tp, &ta, &tb);
+            assert_eq!(a, b, "g={g} d={d} tp={tp:?} ta={ta:?} tb={tb:?}");
+            if a != Q::ZERO {
+                nonzero += 1;
+            }
+        }
+        assert!(nonzero > 40, "非零样本过少：{nonzero}");
     }
 }

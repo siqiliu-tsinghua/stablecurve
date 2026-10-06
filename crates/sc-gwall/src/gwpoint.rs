@@ -61,21 +61,36 @@ fn hook_product(part: &[u32]) -> Q {
     h
 }
 
+/// gwpoint 的分拆展开 ⟨Π τ_k(pt)⟩_{g,d} = Σ_{λ ⊢ d} w(λ)·Π_k f_λ(k) 中的
+/// (w(λ), λ)，w(λ) = (Π 钩长)^{2g−2}；f_λ 见 [`tau_factor`]。
+pub(crate) fn partition_weights(g: u32, d: u32) -> Vec<(Q, Vec<u32>)> {
+    let e = 2 * g as i64 - 2;
+    partition(d)
+        .into_iter()
+        .map(|part| {
+            let base = hook_product(&part);
+            let w = if e >= 0 {
+                q_pow(&base, e as u32)
+            } else {
+                Q::ONE / q_pow(&base, (-e) as u32)
+            };
+            (w, part)
+        })
+        .collect()
+}
+
+/// 单个点插入 τ_k(pt) 在分拆 λ 处的因子 f_λ(k) = power(λ, k+1)/(k+1)!。
+pub(crate) fn tau_factor(part: &[u32], k: u32) -> Q {
+    power(part, k + 1) / fact(k + 1)
+}
+
 /// ⟨Π τ_{k_i}(pt)⟩_{g,d}（不连通；g 为 target 曲线亏格）。GWall `GWpoint`。
 pub fn gwpoint(g: u32, d: u32, tau: &[u32]) -> Q {
-    let e = 2 * g as i64 - 2;
     let mut answer = Q::ZERO;
-    for part in partition(d) {
-        let base = hook_product(&part);
-        let mag = if e >= 0 {
-            q_pow(&base, e as u32)
-        } else {
-            Q::ONE / q_pow(&base, (-e) as u32)
-        };
-        let mut prod = mag;
+    for (w, part) in partition_weights(g, d) {
+        let mut prod = w;
         for &k in tau {
-            let l = k + 1;
-            prod = prod * power(&part, l) / fact(l);
+            prod *= tau_factor(&part, k);
         }
         answer += prod;
     }
