@@ -324,6 +324,11 @@ fn st_recur_calc(psi: &[u32]) -> Q {
         return total;
     }
     let g = (s - n) / 3 + 1;
+    // dilaton：⟨τ₁X⟩_{g,n} = (2g−2+n−1)⟨X⟩_{g,n−1}（升序表的表头；要求剩余
+    // 空间稳定，⟨τ₁⟩₁ 等基例仍走下面的一般递推）。省掉一整轮分裂求和。
+    if psi[0] == 1 && 2 * g - 2 + (n - 1) > 0 {
+        return Q::from(2 * g - 2 + n - 1) * st_recur(&psi[1..]);
+    }
     let d = psi[psi.len() - 1] as i64;
     let mut total = Q::ZERO;
     // 修正项 1：(2d+3)/12 · STrecur([0,0,0,0]+psi, d+1)
