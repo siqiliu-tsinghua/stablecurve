@@ -252,6 +252,109 @@ impl StableGraph {
         }
     }
 
+    /// 装饰单项式（逐顶点 κ 指标表 `kappa[v]`、逐腿 ψ 幂）的同构不变证书：
+    /// 两个装饰 stratum 同构（存在保亏格、保标记、保装饰的图同构）⟺ 证书相等。
+    ///
+    /// 与 [`Self::canonicalize_isomorphic`] 同法：同色（亏格, 标记集）顶点组内
+    /// 枚举安排，在每个安排下按位序编码顶点（亏格、标记、排序后的 κ）、标记
+    /// 上的 ψ 与边（两端的位序与 ψ 幂，端点按 (位序, ψ) 排序；平行边与自环
+    /// 作为多重集排序），取字典序最小者。不要求图已规范化。
+    pub fn decorated_certificate(&self, kappa: &[Vec<u32>], psi: &[(Leg, u32)]) -> Vec<u64> {
+        let n = self.vertices.len();
+        let mk = self.markings;
+        let psi_at = |l: Leg| psi.iter().find(|e| e.0 == l).map_or(0, |e| e.1) as u64;
+        let colors: Vec<(u32, Vec<Leg>)> = self
+            .vertices
+            .iter()
+            .map(|v| {
+                (
+                    v.genus,
+                    v.legs.iter().copied().filter(|&l| l <= mk).collect(),
+                )
+            })
+            .collect();
+        let kap: Vec<Vec<u64>> = (0..n)
+            .map(|v| {
+                let mut k: Vec<u64> = kappa
+                    .get(v)
+                    .map_or_else(Vec::new, |k| k.iter().map(|&x| x as u64).collect());
+                k.sort_unstable();
+                k
+            })
+            .collect();
+        let owner = self.leg_owner();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| colors[a].cmp(&colors[b]));
+        let mut group_end = vec![0usize; n];
+        let mut i = 0;
+        while i < n {
+            let mut j = i + 1;
+            while j < n && colors[order[j]] == colors[order[i]] {
+                j += 1;
+            }
+            group_end[i..j].fill(j);
+            i = j;
+        }
+        let encode = |arr: &[usize], pos: &[usize]| -> Vec<u64> {
+            let mut out = vec![mk as u64, n as u64];
+            for &v in arr {
+                out.push(colors[v].0 as u64);
+                out.push(colors[v].1.len() as u64);
+                out.extend(colors[v].1.iter().map(|&l| l as u64));
+                out.push(kap[v].len() as u64);
+                out.extend_from_slice(&kap[v]);
+            }
+            out.extend((1..=mk).map(psi_at));
+            let mut es: Vec<[u64; 4]> = self
+                .edges
+                .iter()
+                .map(|&(a, b)| {
+                    let x = (pos[owner[a as usize]] as u64, psi_at(a));
+                    let y = (pos[owner[b as usize]] as u64, psi_at(b));
+                    let (x, y) = if x <= y { (x, y) } else { (y, x) };
+                    [x.0, x.1, y.0, y.1]
+                })
+                .collect();
+            es.sort_unstable();
+            out.push(es.len() as u64);
+            out.extend(es.into_iter().flatten());
+            out
+        };
+        fn search(
+            k: usize,
+            group_end: &[usize],
+            arr: &mut Vec<usize>,
+            pos: &mut Vec<usize>,
+            encode: &dyn Fn(&[usize], &[usize]) -> Vec<u64>,
+            best: &mut Option<Vec<u64>>,
+        ) {
+            if k == arr.len() {
+                let code = encode(arr, pos);
+                if best.as_ref().is_none_or(|b| code < *b) {
+                    *best = Some(code);
+                }
+                return;
+            }
+            for i in k..group_end[k] {
+                arr.swap(k, i);
+                pos[arr[k]] = k;
+                pos[arr[i]] = i;
+                search(k + 1, group_end, arr, pos, encode, best);
+                arr.swap(k, i);
+                pos[arr[k]] = k;
+                pos[arr[i]] = i;
+            }
+        }
+        let mut arr = order;
+        let mut pos = vec![0usize; n];
+        for (p, &v) in arr.iter().enumerate() {
+            pos[v] = p;
+        }
+        let mut best = None;
+        search(0, &group_end, &mut arr, &mut pos, &encode, &mut best);
+        best.unwrap_or_default()
+    }
+
     /// 腿 → 所在顶点下标（以腿号直接索引；不在任何顶点上为 `usize::MAX`）。
     fn leg_owner(&self) -> Vec<usize> {
         let max_leg = self
@@ -961,6 +1064,47 @@ mod tests {
             })
             .collect();
         (genera, legs, edges)
+    }
+
+    /// 装饰证书：对腿编号不变；只差自同构的装饰相同；不同构的装饰不同。
+    #[test]
+    fn decorated_certificate_basics() {
+        let none: Vec<Vec<u32>> = vec![];
+        // 同一分离边界图的两种编号，ψ 落在对应的半边上
+        let a = StableGraph::new_raw(&[1, 1], &[vec![1, 3], vec![2, 4]], &[(3, 4)]).unwrap();
+        let b = StableGraph::new_raw(&[1, 1], &[vec![2, 9], vec![1, 7]], &[(9, 7)]).unwrap();
+        assert_eq!(
+            a.decorated_certificate(&[vec![], vec![1]], &[(3, 2)]),
+            b.decorated_certificate(&[vec![1], vec![]], &[(7, 2)])
+        );
+        // 分离边两侧的半边不可互换（标记不同）：ψ 在 3 与在 4 不同
+        assert_ne!(
+            a.decorated_certificate(&none, &[(3, 1)]),
+            a.decorated_certificate(&none, &[(4, 1)])
+        );
+        // Δ₀ 自环的两个半边可互换（翻转是自同构）
+        let d0 = StableGraph::new_raw(&[0], &[vec![1, 2, 3, 4]], &[(3, 4)]).unwrap();
+        assert_eq!(
+            d0.decorated_certificate(&none, &[(3, 1)]),
+            d0.decorated_certificate(&none, &[(4, 1)])
+        );
+        // 4 个同色顶点：4-圈 与 三角形 + 悬挂点 不同构（旧颜色键无法区分）
+        let cycle = StableGraph::new_raw(
+            &[1, 1, 1, 1],
+            &[vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]],
+            &[(2, 3), (4, 5), (6, 7), (8, 1)],
+        )
+        .unwrap();
+        let tadpole = StableGraph::new_raw(
+            &[1, 1, 1, 1],
+            &[vec![1, 2, 3], vec![4, 5], vec![6, 7], vec![8]],
+            &[(1, 4), (5, 6), (7, 2), (3, 8)],
+        )
+        .unwrap();
+        assert_ne!(
+            cycle.decorated_certificate(&none, &[]),
+            tadpole.decorated_certificate(&none, &[])
+        );
     }
 
     /// 回归：单顶点多自环的编码与腿的配对方式无关（原先 (3,5),(4,6) 与

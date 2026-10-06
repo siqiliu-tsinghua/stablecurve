@@ -641,6 +641,18 @@ pub fn generalized_hodge_chern_single(
     g: u32,
     n: u32,
 ) -> Result<TautClass, String> {
+    Ok(merge_isomorphic(&hodge_chern_unmerged(t, l, d, a, g, n)?))
+}
+
+/// 同构项合并前的 ch_t（系数为 oracle 生成元口径，未乘 |Aut|）。
+fn hodge_chern_unmerged(
+    t: u32,
+    l: i64,
+    d: &[i64],
+    a: &[(u32, Vec<u32>, i64)],
+    g: u32,
+    n: u32,
+) -> Result<TautClass, String> {
     if n == 0 {
         return Err("generalized_hodge_chern 需 n ≥ 1".into());
     }
@@ -670,7 +682,7 @@ pub fn generalized_hodge_chern_single(
         }
     }
     parts.push(todd_inv_exp(&asort, t, g, n));
-    Ok(merge_isomorphic(&degree_part(&TautClass::sum(parts), t)))
+    Ok(degree_part(&TautClass::sum(parts), t))
 }
 
 /// twist_div_to_zero(l, d)：使 twist 除子 D = l·K̃ + Σd_iσ_i 拉回到零的
@@ -695,64 +707,20 @@ pub fn twist_div_to_zero(l: i64, d: &[i64], g: u32, n: u32) -> Vec<ATriple> {
     out
 }
 
-/// 同构合并：按"顶点色（genus、标记集、κ 多重集）+ 边装饰（端点色、两侧
-/// ψ 幂）+ 标记 ψ 多重集"的键聚合——同键 ⟹ 同类（链图 new_raw 与分离图
-/// new 构造的同构项在色空间下合并；oracle 的类展示即合并后形式）。
+/// 同构合并：按装饰单项式的完整同构证书（[`StableGraph::decorated_certificate`]）
+/// 聚合——链图 new_raw 与分离图 new 构造的同构项合并为一项（oracle 的类展示
+/// 即合并后形式），代表项取首次出现者。
+///
+/// 原先的键是"顶点色（亏格、标记、κ）多重集 + 边两端色与 ψ 多重集"，不是
+/// 完整的同构不变量（如四个同色顶点连成 4-圈与"三角形 + 悬挂点"键相同），
+/// 理论上会把不同构的项合并。
 fn merge_isomorphic(cl: &TautClass) -> TautClass {
     use std::collections::BTreeMap;
-    // 每项生成 (键, 系数和, 代表项)
-    let mut acc: BTreeMap<String, (DecStratum, Q)> = BTreeMap::new();
+    // 每项生成 (证书, 系数和, 代表项)
+    let mut acc: BTreeMap<Vec<u64>, (DecStratum, Q)> = BTreeMap::new();
     for ds in &cl.terms {
-        let g = &ds.graph;
-        let vertex_of = |l: u32| -> usize {
-            g.vertices()
-                .iter()
-                .position(|v| v.legs.contains(&l))
-                .unwrap()
-        };
-        // 顶点色 = (genus, 标记集, ψ 半边幂集（结点装饰挂在边上）)
-        let vcolor = |vi: usize| -> (u32, Vec<u32>) {
-            (g.vertices()[vi].genus, {
-                let mut m: Vec<u32> = g.vertices()[vi]
-                    .legs
-                    .iter()
-                    .copied()
-                    .filter(|l| *l <= g.num_markings())
-                    .collect();
-                m.sort_unstable();
-                m
-            })
-        };
         for term in &ds.poly.terms {
-            // 顶点完整键：色 + κ 多重集
-            let mut vkeys: Vec<(u32, Vec<u32>, Vec<u32>)> = Vec::new();
-            for vi in 0..g.vertices().len() {
-                let mut k = term.kappa[vi].clone();
-                k.sort_unstable();
-                vkeys.push((vcolor(vi).0, vcolor(vi).1, k));
-            }
-            vkeys.sort();
-            // 边键：(色A,ψ幂) (色B,ψ幂) 排序对
-            let mut ekeys: Vec<((u32, Vec<u32>, u32), (u32, Vec<u32>, u32))> = Vec::new();
-            for &(ea, eb) in g.edges() {
-                let (va, vb) = (vertex_of(ea), vertex_of(eb));
-                let mut ka = (vcolor(va).0, vcolor(va).1, term.psi_power_at(ea));
-                let mut kb = (vcolor(vb).0, vcolor(vb).1, term.psi_power_at(eb));
-                if ka > kb {
-                    std::mem::swap(&mut ka, &mut kb);
-                }
-                ekeys.push((ka, kb));
-            }
-            ekeys.sort();
-            // 标记 ψ
-            let mut mp: Vec<(u32, u32)> = term
-                .psi
-                .iter()
-                .copied()
-                .filter(|(l, _)| *l <= g.num_markings())
-                .collect();
-            mp.sort();
-            let key = format!("{:?}|{:?}|{:?}", vkeys, ekeys, mp);
+            let key = ds.graph.decorated_certificate(&term.kappa, &term.psi);
             let e = acc.entry(key).or_insert_with(|| {
                 (
                     DecStratum {
@@ -795,6 +763,118 @@ pub fn generalized_hodge_chern(
         parts.push(generalized_hodge_chern_single(t, l, d, a, g, n)?);
     }
     Ok(TautClass::sum(parts))
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// 回归：不同构但颜色多重集相同的两个图不被合并（旧键会把 4-圈与
+    /// "三角形 + 悬挂点" 合为一项）；同构的两种写法合并、系数相加。
+    #[test]
+    fn merge_isomorphic_uses_complete_invariant() {
+        let one = |graph: StableGraph, c: i64| DecStratum {
+            graph,
+            poly: KP::new(vec![KpTerm {
+                kappa: vec![vec![]; 4],
+                psi: vec![],
+                coeff: Q::from(c),
+            }]),
+        };
+        let cycle = |legs: [[u32; 2]; 4], edges: [(u32, u32); 4]| {
+            StableGraph::new_raw(&[1, 1, 1, 1], &legs.map(|l| l.to_vec()), &edges).unwrap()
+        };
+        let c1 = cycle(
+            [[1, 2], [3, 4], [5, 6], [7, 8]],
+            [(2, 3), (4, 5), (6, 7), (8, 1)],
+        );
+        let c2 = cycle(
+            [[5, 2], [3, 8], [1, 6], [7, 4]],
+            [(2, 3), (8, 1), (6, 7), (4, 5)],
+        );
+        let tadpole = StableGraph::new_raw(
+            &[1, 1, 1, 1],
+            &[vec![1, 2, 3], vec![4, 5], vec![6, 7], vec![8]],
+            &[(1, 4), (5, 6), (7, 2), (3, 8)],
+        )
+        .unwrap();
+        let merged = merge_isomorphic(&TautClass::new(vec![
+            one(c1.clone(), 1),
+            one(tadpole.clone(), 1),
+            one(c2, 2),
+        ]));
+        assert_eq!(merged.terms.len(), 2);
+        // 系数口径：合并后的系数和 × 代表图的 |Aut|（4-圈为二面体群，8 阶）
+        assert_eq!(c1.automorphism_number(), 8);
+        for t in &merged.terms {
+            let expect = if t.graph == tadpole {
+                tadpole.automorphism_number() as i64
+            } else {
+                3 * 8
+            };
+            assert_eq!(t.poly.terms[0].coeff, Q::from(expect), "{}", t.graph);
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_consistency {
+    use super::*;
+    use crate::classes::int_against;
+
+    /// 合并同构项不改变类：未合并的项各自换算到 ξ_*/|Aut| 口径（乘其图的
+    /// |Aut|）后，与合并后的类对一组 X 的积分逐个相等。旧颜色键在此例把链图
+    /// 中间顶点与末端椭圆尾上的 ψ²（系数 ±1/180）误并为一项而相消。
+    #[test]
+    fn merge_preserves_integrals() {
+        let (t, l, d, g, n) = (4u32, 1i64, vec![1i64, 1, -2], 3u32, 3u32);
+        let a = twist_div_to_zero(l, &d, g, n);
+        let raw = hodge_chern_unmerged(t, l, &d, &a, g, n).unwrap();
+        let scaled = TautClass::new(
+            raw.terms
+                .iter()
+                .map(|ds| DecStratum {
+                    graph: ds.graph.clone(),
+                    poly: ds
+                        .poly
+                        .scale(&Q::from(ds.graph.automorphism_number() as i64)),
+                })
+                .collect(),
+        );
+        let merged = merge_isomorphic(&raw);
+        // X：余维 3g−3+n−t = 5 的 κ-ψ 单项式
+        let mut xs: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>)> = Vec::new();
+        for p1 in 0..=5u32 {
+            for p2 in 0..=5 - p1 {
+                let p3 = 5 - p1 - p2;
+                let psi: Vec<(u32, u32)> = [(1, p1), (2, p2), (3, p3)]
+                    .into_iter()
+                    .filter(|&(_, p)| p > 0)
+                    .collect();
+                xs.push((vec![], psi));
+            }
+        }
+        for kappa in [
+            vec![(1, 5)],
+            vec![(1, 3), (2, 1)],
+            vec![(5, 1)],
+            vec![(2, 2), (1, 1)],
+        ] {
+            xs.push((kappa, vec![]));
+        }
+        xs.push((vec![(1, 2)], vec![(1, 2), (3, 1)]));
+        xs.push((vec![(3, 1)], vec![(2, 2)]));
+        let mut nonzero = 0;
+        for (kappa, psi) in &xs {
+            let lhs = int_against(&scaled, kappa, psi).unwrap();
+            let rhs = int_against(&merged, kappa, psi).unwrap();
+            assert_eq!(lhs, rhs, "κ={kappa:?} ψ={psi:?}");
+            if lhs != Q::ZERO {
+                nonzero += 1;
+            }
+        }
+        assert!(nonzero > 5, "非零积分过少：{nonzero}");
+    }
 }
 
 #[cfg(test)]
