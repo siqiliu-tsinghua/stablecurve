@@ -72,11 +72,18 @@ fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
         }
         // (b) 分裂顶点 vi 为两个顶点，中间加一条边
         // 顶点内容（亏格 g_v，腿集 L）→ (g1, L1) + (g2, L2)，g1+g2 = g_v；
-        // L1 可为空（如 M̄_2 的 Δ_1：两个 g1 顶点无边外腿），子集与补集
-        // 会产生重复图，由规范形 seen 去重。
+        // L1 可为空（如 M̄_2 的 Δ_1：两个 g1 顶点无边外腿）。(L1, g1) 与
+        // (L2, g2) 是同一个图，故只取含首条腿的 L1（无腿时只取 g1 ≤ g2）；
+        // 两个新顶点须稳定（2g + 腿数 ≥ 3，腿数含新结点半边）。其余重复由
+        // 规范形 seen 去重。
         let legs_v = v.legs.clone();
         let m = legs_v.len();
         for mask in 0u32..(1u32 << m) {
+            if m > 0 && mask & 1 == 0 {
+                continue;
+            }
+            let k1 = mask.count_ones();
+            let k2 = m as u32 - k1;
             let l1: Vec<Leg> = legs_v
                 .iter()
                 .enumerate()
@@ -91,6 +98,9 @@ fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
                 .collect();
             for g1 in 0..=v.genus {
                 let g2 = v.genus - g1;
+                if (m == 0 && g1 > g2) || 2 * g1 + k1 < 2 || 2 * g2 + k2 < 2 {
+                    continue;
+                }
                 let (e1, e2) = (new_leg(), new_leg());
                 let mut genera: Vec<u32> = vs.iter().map(|x| x.genus).collect();
                 let mut legs: Vec<Vec<Leg>> = vs.iter().map(|x| x.legs.clone()).collect();
