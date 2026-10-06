@@ -65,6 +65,12 @@ impl FABER {
         faber::socle::cache_attached()
     }
 
+    /// 清空内存中的稳定图缓存（dr 等按 (g, n) 逐层缓存枚举出的稳定图，
+    /// 大的 (g, n, 余维) 可达数十万个图、数百 MB；只影响当前线程）。
+    fn clear_graph_cache(&self) {
+        faber::generators::clear_graph_cache();
+    }
+
     /// ∫ κ^kappa · ψ^psi · λ^lam · ch^ch（M̄_{g,n} 基本类上单项式）→ Fraction。
     #[pyo3(signature = (g, n, kappa=Vec::new(), psi=Vec::new(), lam=Vec::new(), ch=Vec::new()))]
     fn klp(

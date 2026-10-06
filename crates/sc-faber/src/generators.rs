@@ -11,34 +11,65 @@ use crate::graph::{Leg, StableGraph};
 use crate::kppoly::{KappaPsiPolynomial, KpTerm};
 use crate::taut::DecStratum;
 use sc_num::{One, Q};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
-/// 枚举 (g, n) 余维数恰为 codim 的全部连通稳定图（无装饰）。
-pub fn graphs(g: u32, n: u32, codim: u32) -> Vec<StableGraph> {
-    let base = match StableGraph::new(&[g], &[(1..=n).collect::<Vec<Leg>>()], &[]) {
-        Ok(gr) => gr,
-        Err(_) => return vec![],
+thread_local! {
+    /// (g, n) → 已算出的图层：layers[c] = 余维恰为 c 的全部图（按发现顺序）。
+    /// 每层只由上一层确定性地生成，故缓存与否结果相同。
+    static LAYERS: RefCell<HashMap<(u32, u32), Vec<Rc<Vec<StableGraph>>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 余维恰为 codim 的图层：按 (g, n) 逐层缓存，只补算缺失的层。
+/// （原先每次调用都从基本类重推，graphs_upto 因此把第 c 层算 d−c+1 遍。）
+fn layer(g: u32, n: u32, codim: u32) -> Rc<Vec<StableGraph>> {
+    let cached = LAYERS.with(|m| m.borrow().get(&(g, n)).cloned().unwrap_or_default());
+    if let Some(l) = cached.get(codim as usize) {
+        return l.clone();
+    }
+    let mut prev = match cached.last() {
+        Some(l) => l.clone(),
+        None => {
+            let base = StableGraph::new(&[g], &[(1..=n).collect::<Vec<Leg>>()], &[])
+                .map_or_else(|_| vec![], |gr| vec![gr]);
+            let base = Rc::new(base);
+            LAYERS.with(|m| m.borrow_mut().insert((g, n), vec![base.clone()]));
+            base
+        }
     };
-    let mut layer: Vec<StableGraph> = vec![base];
-    let mut seen: HashSet<StableGraph> = layer.iter().cloned().collect();
-    for _ in 0..codim {
+    for _ in cached.len().max(1)..=codim as usize {
+        let mut seen: HashSet<StableGraph> = HashSet::new();
         let mut next: Vec<StableGraph> = Vec::new();
-        for gr in &layer {
+        for gr in prev.iter() {
             for h in one_step_expansions(gr) {
                 if h.codim() == gr.codim() + 1 && seen.insert(h.clone()) {
                     next.push(h);
                 }
             }
         }
-        layer = next;
-        // seen 需要跨层累积（codim 严格递增，此处天然不重）
+        prev = Rc::new(next);
+        LAYERS.with(|m| m.borrow_mut().get_mut(&(g, n)).unwrap().push(prev.clone()));
     }
-    layer
+    prev
+}
+
+/// 清空图层缓存（本线程）。缓存随用随长，大的 (g, n, 余维) 可达数十万个图。
+pub fn clear_graph_cache() {
+    LAYERS.with(|m| m.borrow_mut().clear());
+}
+
+/// 枚举 (g, n) 余维数恰为 codim 的全部连通稳定图（无装饰）。
+pub fn graphs(g: u32, n: u32, codim: u32) -> Vec<StableGraph> {
+    layer(g, n, codim).as_ref().clone()
 }
 
 /// 余维数 ≤ codim 的全部连通稳定图。
 pub fn graphs_upto(g: u32, n: u32, codim: u32) -> Vec<StableGraph> {
-    (0..=codim).flat_map(|c| graphs(g, n, c)).collect()
+    (0..=codim)
+        .flat_map(|c| layer(g, n, c).as_ref().clone())
+        .collect()
 }
 
 /// 对图 Γ 做一步"余维 +1"扩张：在某顶点加自环（genus−1），或分裂某顶点。
@@ -127,13 +158,14 @@ fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
 /// R^d(M̄_{g,n}) 的生成元列表（图 + 权重 d−codim(图) 的 κ-ψ 单项式）。
 pub fn tautgens(g: u32, n: u32, d: u32) -> Vec<DecStratum> {
     let mut out = Vec::new();
-    for gr in graphs_upto(g, n, d) {
-        let w = d - gr.codim();
-        for mono in monomials(&gr, w) {
-            out.push(DecStratum {
-                graph: gr.clone(),
-                poly: mono,
-            });
+    for c in 0..=d {
+        for gr in layer(g, n, c).iter() {
+            for mono in monomials(gr, d - c) {
+                out.push(DecStratum {
+                    graph: gr.clone(),
+                    poly: mono,
+                });
+            }
         }
     }
     out
@@ -335,5 +367,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 图层缓存：乱序请求、重复请求、清空后重算，结果逐层一致。
+    #[test]
+    fn graph_cache_consistent() {
+        clear_graph_cache();
+        let c3 = graphs(2, 2, 3);
+        let c1 = graphs(2, 2, 1);
+        let all = graphs_upto(2, 2, 4);
+        clear_graph_cache();
+        assert_eq!(graphs(2, 2, 1), c1);
+        assert_eq!(graphs(2, 2, 3), c3);
+        assert_eq!(graphs_upto(2, 2, 4), all);
+        assert_eq!(graphs_upto(2, 2, 4), all);
+        let mut layered: Vec<StableGraph> = Vec::new();
+        for c in 0..=4 {
+            layered.extend(graphs(2, 2, c));
+        }
+        assert_eq!(layered, all);
+        // 不稳定的 (g, n)：各层皆空
+        assert!(graphs(0, 2, 0).is_empty() && graphs(0, 2, 2).is_empty());
     }
 }

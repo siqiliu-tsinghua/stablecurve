@@ -142,6 +142,11 @@ the persistent cache. The persistent cache is **process-wide**: creating a
 new `FABER` replaces (or detaches) the cache of earlier instances, and
 `cache_attached` reports the current state.
 
+Stable graphs enumerated for `dr` are also kept in memory, layer by layer
+per (g, n), so repeated calls reuse them. Large cases can hold hundreds of
+thousands of graphs (a few hundred MB); `f.clear_graph_cache()` releases
+them.
+
 Note: the pyo3 layer currently exposes `klp`/`dr`; use the CLI for the
 remaining ops.
 

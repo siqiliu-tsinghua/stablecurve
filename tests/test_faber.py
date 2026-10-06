@@ -75,6 +75,12 @@ def test_input_normalization(f):
     assert f.klp(2, 2, psi=[(1, 2)], lam=[(3, 1)]) == Fraction(0)
 
 
+def test_clear_graph_cache(f):
+    v = f.dr(2, [1, 1, -2], r=2, kappa=[(1, 1)], psi=[(1, 3)])
+    f.clear_graph_cache()
+    assert f.dr(2, [1, 1, -2], r=2, kappa=[(1, 1)], psi=[(1, 3)]) == v == Fraction(13, 144)
+
+
 def test_cache_is_process_global(tmp_path):
     c = tmp_path / "g.sqlite"
     a = FABER(cache=str(c))
