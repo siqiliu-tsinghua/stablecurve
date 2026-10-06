@@ -64,20 +64,59 @@ pub fn divided_bernoulli_poly(l: i64, n: u32) -> Q {
     bern_poly_val(n, l) / fact(n)
 }
 
-/// weak compositions of t into k 份（= sage IntegerVectors(t, k)）。
-fn comps(t: u32, k: u32) -> Vec<Vec<u32>> {
-    if k == 0 {
-        return if t == 0 { vec![vec![]] } else { vec![] };
-    }
-    if k == 1 {
-        return vec![vec![t]];
+/// 有序链与正分配：a 的下标升序子列 i_1 < … < i_L（相邻两项 h 不减、S 包含，
+/// 见 [`chain_step`]），连同 total 分成 L 个正整数的全部有序分配。
+///
+/// 参考实现枚举 total 分进 |a| 份的全部弱组合（sage IntegerVectors），再取
+/// 非零分量为活跃项、检查链条件；两者一一对应，但 |a| 大时绝大多数组合不成链
+/// （|a| = 27、total = 6 时组合数约 10⁶，成链的只有千余），故直接枚举链。
+fn chains_with_parts(a: &[ATriple], total: u32) -> Vec<(Vec<usize>, Vec<u32>)> {
+    fn extend(
+        a: &[ATriple],
+        total: u32,
+        chain: &mut Vec<usize>,
+        out: &mut Vec<(Vec<usize>, Vec<u32>)>,
+    ) {
+        let l = chain.len() as u32;
+        if l > total {
+            return;
+        }
+        // total 分成 l 个正整数的全部有序分配
+        let mut parts = vec![0u32; l as usize];
+        fn split(
+            rem: u32,
+            i: usize,
+            parts: &mut Vec<u32>,
+            chain: &[usize],
+            out: &mut Vec<(Vec<usize>, Vec<u32>)>,
+        ) {
+            if i + 1 == parts.len() {
+                parts[i] = rem;
+                out.push((chain.to_vec(), parts.clone()));
+                return;
+            }
+            let later = (parts.len() - i - 1) as u32;
+            for p in 1..=rem - later {
+                parts[i] = p;
+                split(rem - p, i + 1, parts, chain, out);
+            }
+        }
+        split(total, 0, &mut parts, chain, out);
+        let last = *chain.last().unwrap();
+        for j in last + 1..a.len() {
+            if chain_step(&a[last], &a[j]) {
+                chain.push(j);
+                extend(a, total, chain, out);
+                chain.pop();
+            }
+        }
     }
     let mut out = Vec::new();
-    for e in 0..=t {
-        for mut rest in comps(t - e, k - 1) {
-            rest.insert(0, e);
-            out.push(rest);
-        }
+    if total == 0 {
+        return out;
+    }
+    for i in 0..a.len() {
+        extend(a, total, &mut vec![i], &mut out);
     }
     out
 }
@@ -458,30 +497,18 @@ fn chain_parts(
     (genera, labels, edges)
 }
 
-fn ordered_chain(atn: &[(u32, Vec<u32>, i64)]) -> bool {
-    (0..atn.len().saturating_sub(1))
-        .all(|i| atn[i].0 <= atn[i + 1].0 && atn[i].1.iter().all(|x| atn[i + 1].1.contains(x)))
-}
-
-fn pick_active(a: &[ATriple], tvect: &[u32]) -> (Vec<(u32, Vec<u32>, i64)>, Vec<u32>) {
-    let mut atn = Vec::new();
-    let mut tvn = Vec::new();
-    for (ai, &tvi) in a.iter().zip(tvect) {
-        if tvi != 0 {
-            atn.push(ai.clone());
-            tvn.push(tvi);
-        }
-    }
-    (atn, tvn)
+/// 链的相邻关系：h 不减且 S 包含。
+fn chain_step(x: &ATriple, y: &ATriple) -> bool {
+    x.0 <= y.0 && x.1.iter().all(|s| y.1.contains(s))
 }
 
 /// generalized_hodge_chern_exp(t, a)：e^C 项（末 tvn > 1；最后段指数 tv−1−j−1）。
 fn chern_exp(t: u32, a: &[ATriple], g: u32, n: u32) -> TautClass {
     let mut parts: Vec<TautClass> = Vec::new();
-    for tvect in comps(t + 1, a.len() as u32) {
-        let (atn, tvn) = pick_active(a, &tvect);
+    for (idx, tvn) in chains_with_parts(a, t + 1) {
+        let atn: Vec<ATriple> = idx.iter().map(|&i| a[i].clone()).collect();
         let l = atn.len();
-        if l == 0 || !ordered_chain(&atn) || tvn[l - 1] <= 1 {
+        if tvn[l - 1] <= 1 {
             continue;
         }
         let (genera, labels, edges) = chain_parts(n, g, &atn, &[n + 2 * l as u32]);
@@ -525,12 +552,9 @@ fn chern_kin(alpha: u32, beta: u32, a: &[ATriple], g: u32, n: u32) -> TautClass 
         }]);
     }
     let mut parts: Vec<TautClass> = Vec::new();
-    for tvect in comps(alpha, a.len() as u32) {
-        let (atn, tvn) = pick_active(a, &tvect);
+    for (idx, tvn) in chains_with_parts(a, alpha) {
+        let atn: Vec<ATriple> = idx.iter().map(|&i| a[i].clone()).collect();
         let l = atn.len();
-        if l == 0 || !ordered_chain(&atn) {
-            continue;
-        }
         let scomp: Vec<u32> = (1..=n).filter(|x| !atn[l - 1].1.contains(x)).collect();
         let (genera, labels, edges) = chain_parts(n, g, &atn, &[n + 2 * l as u32]);
         let nv = genera.len();
@@ -553,13 +577,17 @@ pub fn todd_inv_exp(a: &[ATriple], t: u32, g: u32, n: u32) -> TautClass {
     let mut t1 = 1;
     while t1 < t {
         let coeff = divided_bernoulli(t1 + 1) / fact(t - t1);
-        for tvect in comps(t - t1, a.len() as u32) {
+        // 不成链的组合在 todd_inv_exp_graphs 中为零，只需枚举链；零分量对
+        // Π a_i^{tv_i} 与多项式系数都贡献 1
+        for (idx, tv) in chains_with_parts(a, t - t1) {
+            let mut tvect = vec![0u32; a.len()];
             let mut c = coeff.clone();
-            for (ai, &tvi) in a.iter().zip(&tvect) {
-                c *= q_powi(ai.2, tvi);
+            for (&i, &p) in idx.iter().zip(&tv) {
+                tvect[i] = p;
+                c *= q_powi(a[i].2, p);
             }
             let graphs = todd_inv_exp_graphs(a, t1, &tvect, g, n);
-            parts.push(graphs.scale(&(c * multinomial(&tvect))));
+            parts.push(graphs.scale(&(c * multinomial(&tv))));
         }
         t1 += 2;
     }
@@ -576,14 +604,11 @@ fn chern_sin(alpha: u32, beta: u32, p: u32, a: &[ATriple], g: u32, n: u32) -> Ta
         return psi_only(g, n, p, beta - 1, q_powi(-1, beta - 1));
     }
     let mut parts: Vec<TautClass> = Vec::new();
-    for tvect in comps(alpha, a.len() as u32) {
-        let (atn, tvn) = pick_active(a, &tvect);
+    for (idx, tvn) in chains_with_parts(a, alpha) {
+        let atn: Vec<ATriple> = idx.iter().map(|&i| a[i].clone()).collect();
         let l = atn.len();
-        if l == 0 {
-            continue;
-        }
         let scomp: Vec<u32> = (1..=n).filter(|x| !atn[l - 1].1.contains(x)).collect();
-        if !ordered_chain(&atn) || !scomp.contains(&p) {
+        if !scomp.contains(&p) {
             continue;
         }
         let (genera, labels, edges) = chain_parts(n, g, &atn, &[n + 2 * l as u32]);
@@ -963,6 +988,48 @@ mod tests {
         assert_eq!(divided_bernoulli_poly(1, 2).to_string(), "1/12");
         assert_eq!(divided_bernoulli_poly(-1, 3).to_string(), "-1/2");
         assert_eq!(divided_bernoulli_poly(3, 1).to_string(), "5/2");
+    }
+
+    /// 回归：直接枚举链 == 枚举 total 分进 |a| 份的全部弱组合后按链条件过滤。
+    #[test]
+    fn chains_match_composition_filter() {
+        fn comps(t: u32, k: usize) -> Vec<Vec<u32>> {
+            if k == 0 {
+                return if t == 0 { vec![vec![]] } else { vec![] };
+            }
+            let mut out = Vec::new();
+            for e in 0..=t {
+                for mut rest in comps(t - e, k - 1) {
+                    rest.insert(0, e);
+                    out.push(rest);
+                }
+            }
+            out
+        }
+        for (l, d, g, n) in [
+            (1i64, vec![1i64, -1], 1u32, 2u32),
+            (1, vec![2, 1, -3], 2, 3),
+            (3, vec![3, 4], 2, 2),
+            (1, vec![1, 1, 1, -3], 2, 4),
+        ] {
+            let mut a = twist_div_to_zero(l, &d, g, n);
+            a.sort_by(|x, y| x.1.cmp(&y.1).then(x.2.cmp(&y.2)));
+            for total in 0..=4 {
+                let mut brute: Vec<(Vec<usize>, Vec<u32>)> = comps(total, a.len())
+                    .into_iter()
+                    .filter_map(|tv| {
+                        let idx: Vec<usize> = (0..a.len()).filter(|&i| tv[i] > 0).collect();
+                        let ok = !idx.is_empty()
+                            && idx.windows(2).all(|w| chain_step(&a[w[0]], &a[w[1]]));
+                        ok.then(|| (idx.clone(), idx.iter().map(|&i| tv[i]).collect()))
+                    })
+                    .collect();
+                let mut fast = chains_with_parts(&a, total);
+                brute.sort();
+                fast.sort();
+                assert_eq!(fast, brute, "a={a:?} total={total}");
+            }
+        }
     }
 
     /// todd_inv_exp([],1,1,2)：loop 1/24 + 分离 1/12（oracle doctest）。
