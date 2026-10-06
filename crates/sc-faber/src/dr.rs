@@ -21,6 +21,9 @@ use crate::generators::tautgens;
 use crate::kppoly::KappaPsiPolynomial;
 use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 fn fact(n: u64) -> Q {
     let mut r = Q::ONE;
@@ -30,46 +33,34 @@ fn fact(n: u64) -> Q {
     r
 }
 
-/// 枚举平衡权重系统的和：Σ Π_e w_e^{2 exp_e}（mod m 平衡）。
-/// 递归逐边赋值，逐顶点跟踪 mod m 余数。
-fn balanced_weight_sum(edges: &[(usize, usize)], exps: &[u32], given: &[i64], m: i64) -> Q {
-    // 余数状态：每顶点 (given + Σin − Σout) mod m
-    let init: Vec<i64> = given.iter().map(|&x| x.rem_euclid(m)).collect();
-    fn rec(
-        i: usize,
-        state: &mut [i64],
-        edges: &[(usize, usize)],
-        exps: &[u32],
-        m: i64,
-        acc: &Q,
-    ) -> Q {
-        if i == edges.len() {
-            if state.iter().all(|&s| s == 0) {
-                return acc.clone();
-            }
-            return Q::ZERO;
-        }
-        let (u, v) = edges[i];
-        let mut total = Q::ZERO;
-        for w in 0..m {
-            let mut term = Q::ONE;
-            for _ in 0..2 * exps[i] {
-                term *= Q::from(w);
-            }
-            if exps[i] == 0 {
-                term = Q::ONE;
-            }
-            // u 出边 +w，v 入边 −w（mod m）
-            state[u] = (state[u] + w).rem_euclid(m);
-            state[v] = (state[v] - w).rem_euclid(m);
-            total += rec(i + 1, state, edges, exps, m, &(acc.clone() * &term));
-            state[u] = (state[u] - w).rem_euclid(m);
-            state[v] = (state[v] + w).rem_euclid(m);
-        }
-        total
+/// 边因子表 [w^{2s}]_{w=0..m−1}（按 (s, m) 跨生成元缓存）。
+fn weight_table(s: u32, m: i64) -> Rc<Vec<Q>> {
+    thread_local! {
+        static MEMO: RefCell<HashMap<(u32, i64), Rc<Vec<Q>>>> = RefCell::new(HashMap::new());
     }
-    let mut state = init;
-    rec(0, &mut state, edges, exps, m, &Q::ONE)
+    if let Some(t) = MEMO.with(|c| c.borrow().get(&(s, m)).cloned()) {
+        return t;
+    }
+    let t: Rc<Vec<Q>> = Rc::new(
+        (0..m)
+            .map(|w| {
+                let mut t = Q::ONE;
+                for _ in 0..2 * s {
+                    t *= Q::from(w);
+                }
+                t
+            })
+            .collect(),
+    );
+    MEMO.with(|c| c.borrow_mut().insert((s, m), t.clone()));
+    t
+}
+
+/// 平衡权重系统的和：Σ Π_e w_e^{2 exp_e}（mod m 平衡，u 出边 +w、v 入边 −w）。
+fn balanced_weight_sum(edges: &[(usize, usize)], exps: &[u32], given: &[i64], m: i64) -> Q {
+    let tables: Vec<Rc<Vec<Q>>> = exps.iter().map(|&s| weight_table(s, m)).collect();
+    let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
+    crate::flow::balanced_flow_sum(edges, given, m, &table)
 }
 
 /// 拉格朗日插值：给定点 (xs, ys)，求 p(0)。

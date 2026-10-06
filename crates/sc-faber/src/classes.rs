@@ -238,10 +238,24 @@ fn apoly_eval(p: &APoly, a: &[Q]) -> Q {
     acc
 }
 
+/// [`edge_coeff_calc`] 的记忆化（只依赖 (e1, e2)，展开代价随 e1+e2 指数增长）。
+fn edge_coeff(e1: u32, e2: u32) -> std::rc::Rc<APoly> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<(u32, u32), std::rc::Rc<APoly>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(p) = MEMO.with(|m| m.borrow().get(&(e1, e2)).cloned()) {
+        return p;
+    }
+    let p = std::rc::Rc::new(edge_coeff_calc(e1, e2));
+    MEMO.with(|m| m.borrow_mut().insert((e1, e2), p.clone()));
+    p
+}
+
 /// edge_power_series：h = (1−exp(Σ_i A_i(X^{i+1}−(−Y)^{i+1})))/(X+Y)
 /// 的 (X^{e1}Y^{e2})-系数（A-多项式）。用 h = −Σ_{k≥1}(X+Y)^{k−1}S^k/k!，
 /// S = Σ_i A_i Σ_{j=0}^{i} X^{i−j}(−Y)^j。
-fn edge_coeff(e1: u32, e2: u32) -> APoly {
+fn edge_coeff_calc(e1: u32, e2: u32) -> APoly {
     let d = e1 + e2;
     // S 的单项式表：(xdeg, ydeg, A_i, sign)
     let mut s_mons: Vec<(u32, u32, u32, i64)> = Vec::new();
@@ -312,6 +326,33 @@ fn edge_coeff(e1: u32, e2: u32) -> APoly {
         }
     }
     acc.get(&(e1, e2)).cloned().unwrap_or_default()
+}
+
+/// 边因子表 [econtrib(e1, e2, w, m)]_{w=0..m−1}，spin 时偶 w 记 0
+/// （按 (e1, e2, m, spin) 跨生成元缓存：同一批插值点被全部生成元共用）。
+fn econtrib_table(e1: u32, e2: u32, m: i64, spin: bool) -> std::rc::Rc<Vec<Q>> {
+    type Key = (u32, u32, i64, bool);
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<Vec<Q>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (e1, e2, m, spin);
+    if let Some(t) = MEMO.with(|c| c.borrow().get(&key).cloned()) {
+        return t;
+    }
+    let t: std::rc::Rc<Vec<Q>> = std::rc::Rc::new(
+        (0..m)
+            .map(|w| {
+                if spin && w % 2 == 0 {
+                    Q::ZERO
+                } else {
+                    econtrib(e1, e2, w, m)
+                }
+            })
+            .collect(),
+    );
+    MEMO.with(|c| c.borrow_mut().insert(key, t.clone()));
+    t
 }
 
 /// econtrib(e1, e2, w1, r)。
@@ -509,59 +550,16 @@ fn chiodo_coeff_at(
 
     let s: i64 = given.iter().sum();
     given[0] -= s;
-    let ne = edges_v.len();
     let h0 = (graph.edges().len() as i64) - (nv as i64) + 1;
-    let mut total = Q::ZERO;
-    let mut w = vec![0i64; ne];
-    fn recw(
-        i: usize,
-        w: &mut Vec<i64>,
-        state: &mut Vec<i64>,
-        edges: &[(usize, usize)],
-        fine: &[(u32, u32)],
-        m: i64,
-        acc: &Q,
-        total: &mut Q,
-        spin: bool,
-    ) {
-        if i == edges.len() {
-            if state.iter().all(|&x| x == 0) {
-                if spin && w.iter().any(|&x| x % 2 == 0) {
-                    return;
-                }
-                let mut term = acc.clone();
-                for (j, &(e1, e2)) in fine.iter().enumerate() {
-                    // 我们枚举的 w 满足 Bw = −given，参考的 v 满足 Bv = given，
-                    // 故 w = −v；参考代入 −v，我们应代入 w（codex 仲裁 2026-10-05）
-                    let w1 = w[j].rem_euclid(m);
-                    term *= econtrib(e1, e2, w1, m);
-                }
-                *total += term;
-            }
-            return;
-        }
-        let (u, v) = edges[i];
-        for x in 0..m {
-            w[i] = x;
-            state[u] = (state[u] + x) % m;
-            state[v] = ((state[v] - x) % m + m) % m;
-            recw(i + 1, w, state, edges, fine, m, acc, total, spin);
-            state[u] = ((state[u] - x) % m + m) % m;
-            state[v] = (state[v] + x) % m;
-        }
-    }
-    let mut state: Vec<i64> = given.iter().map(|&x| x.rem_euclid(m)).collect();
-    recw(
-        0,
-        &mut w,
-        &mut state,
-        &edges_v,
-        &exps_fine,
-        m,
-        &Q::ONE,
-        &mut total,
-        spin,
-    );
+    // 边因子按 w ∈ 0..m 制表。我们的 w 满足 Bw = −given，参考的 v 满足
+    // Bv = given，故 w = −v；参考代入 −v，我们应代入 w（codex 仲裁
+    // 2026-10-05）。spin 时只数奇权重：偶 w 记 0。
+    let tables: Vec<std::rc::Rc<Vec<Q>>> = exps_fine
+        .iter()
+        .map(|&(e1, e2)| econtrib_table(e1, e2, m, spin))
+        .collect();
+    let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
+    let total = crate::flow::balanced_flow_sum(&edges_v, &given, m, &table);
     let mut mpow = Q::ONE;
     let e = 2 * d as i64 - h0;
     if e >= 0 {

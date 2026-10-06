@@ -93,7 +93,22 @@ fn sum_pow_coeffs(k: u32) -> PX {
 }
 
 /// P_d(X,a)：a-多项式（外层升幂），系数 ∈ QQ[X]。
-fn pm_poly(d: u32) -> Vec<PX> {
+/// [`pm_poly_calc`] 的记忆化：P_d 只依赖 d，而每层递推都是整套多项式运算；
+/// leg_factor/edge_factor 在权重枚举中被反复调用，不缓存时每次都从 P_0 重建。
+fn pm_poly(d: u32) -> std::rc::Rc<Vec<PX>> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<u32, std::rc::Rc<Vec<PX>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(p) = MEMO.with(|m| m.borrow().get(&d).cloned()) {
+        return p;
+    }
+    let p = std::rc::Rc::new(pm_poly_calc(d));
+    MEMO.with(|m| m.borrow_mut().insert(d, p.clone()));
+    p
+}
+
+fn pm_poly_calc(d: u32) -> Vec<PX> {
     if d == 0 {
         return vec![vec![Q::ONE]];
     }
@@ -292,6 +307,22 @@ pub fn edge_factor(w1: i64, m: i64, d1: u32, d2: u32) -> Q {
     Q::ZERO - t
 }
 
+/// 边因子表 [edge_factor(x, m, d1, d2)]_{x=0..m−2}（按 (d1, d2, m) 跨生成元缓存）。
+fn edge_table(d1: u32, d2: u32, m: i64) -> std::rc::Rc<Vec<Q>> {
+    type Key = (u32, u32, i64);
+    thread_local! {
+        static MEMO: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<Vec<Q>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(t) = MEMO.with(|c| c.borrow().get(&(d1, d2, m)).cloned()) {
+        return t;
+    }
+    let t: std::rc::Rc<Vec<Q>> =
+        std::rc::Rc::new((0..m - 1).map(|x| edge_factor(x, m, d1, d2)).collect());
+    MEMO.with(|c| c.borrow_mut().insert((d1, d2, m), t.clone()));
+    t
+}
+
 fn num_lcm(a: i64, b: i64) -> i64 {
     let (a, b) = (a.abs(), b.abs());
     let g = num_gcd(a, b);
@@ -399,56 +430,17 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
                 let ai_m = cn * m / cd + dd; // step | m 保证整除
                 given[vi] += ai_m - e;
             }
-            // 边权枚举 mod (m−1)
+            // 边权枚举 mod (m−1)：起点 += x、终点 −= x+2+e₁+e₂。常数部分
+            // 并入给定值，剩下的 ±x 即平衡流；边因子按 x ∈ 0..m−1 制表
+            // （同 (e₁, e₂) 的边共用一张表）
             let mm = m - 1;
-            let mut total = Q::ZERO;
-            let mut w = vec![0i64; ne];
-            let mut vw = vec![0i64; nv];
-            fn rec(
-                i: usize,
-                w: &mut Vec<i64>,
-                vw: &mut Vec<i64>,
-                edges: &[(usize, usize)],
-                exps: &[(u32, u32)],
-                given: &[i64],
-                mm: i64,
-                m: i64,
-                acc: &Q,
-                total: &mut Q,
-            ) {
-                if i == edges.len() {
-                    if vw
-                        .iter()
-                        .enumerate()
-                        .all(|(vi, &x)| (given[vi] + x) % mm == 0)
-                    {
-                        *total += acc.clone();
-                    }
-                    return;
-                }
-                let (u, v) = edges[i];
-                for x in 0..mm {
-                    w[i] = x;
-                    vw[u] += x;
-                    vw[v] -= x + 2 + exps[i].0 as i64 + exps[i].1 as i64;
-                    let term = acc.clone() * edge_factor(x, m, exps[i].0, exps[i].1);
-                    rec(i + 1, w, vw, edges, exps, given, mm, m, &term, total);
-                    vw[u] -= x;
-                    vw[v] += x + 2 + exps[i].0 as i64 + exps[i].1 as i64;
-                }
+            for (&(_, v), &(e1, e2)) in edges_v.iter().zip(&exps) {
+                given[v] -= 2 + e1 as i64 + e2 as i64;
             }
-            rec(
-                0,
-                &mut w,
-                &mut vw,
-                &edges_v,
-                &exps,
-                &given,
-                mm,
-                m,
-                &Q::ONE,
-                &mut total,
-            );
+            let tables: Vec<std::rc::Rc<Vec<Q>>> =
+                exps.iter().map(|&(e1, e2)| edge_table(e1, e2, m)).collect();
+            let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
+            let total = crate::flow::balanced_flow_sum(&edges_v, &given, mm, &table);
             // total·(m−1)^{−h0}：参考 mvalues.append(total * ZZ(m-1)**(-h0))
             let mut mpow = Q::ONE;
             for _ in 0..h0 {
