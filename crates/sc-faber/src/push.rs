@@ -166,7 +166,6 @@ pub fn push(g: u32, n: u32, p: &KappaPsiPolynomial) -> Result<KappaPsiPolynomial
 mod tests {
     use super::*;
     use crate::kppoly::KappaPsiPolynomial as KP;
-    use crate::tau::Tau;
     use sc_num::{One, Zero};
 
     fn kpw(i: u32, p: u32) -> KP {
@@ -176,23 +175,9 @@ mod tests {
         KP::psi_power(l, p)
     }
 
-    /// 参考求值：κ→ψ 展开后走 τ（仅用于 g=0 测试）。
+    /// 参考求值（g=0）：走 socle（κ 乘积带集合分划修正；过权项记 0）。
     fn int0(n: u32, p: &KP) -> Q {
-        let mut tau = Tau::new();
-        let mut acc = Q::ZERO;
-        for t in &p.terms {
-            let part = t.kappa.first().cloned().unwrap_or_default();
-            let mut d = vec![0u32; n as usize];
-            for &(l, pw) in &t.psi {
-                d[(l - 1) as usize] = pw;
-            }
-            for (k, &i) in part.iter().enumerate() {
-                d.push(i + 1); // κ_i = π_*ψ^{i+1}
-                let _ = k;
-            }
-            acc += &t.coeff * tau.eval(&d).unwrap();
-        }
-        acc
+        crate::int::int_fund(0, n, p).unwrap()
     }
 
     #[test]
@@ -275,8 +260,9 @@ mod tests {
     fn kappa_to_psi_expansion_values() {
         // ∫_{0,4} κ_1 = ∫_{0,5} ψ_5² = 2!/2! = 1
         assert_eq!(int0(4, &kpw(1, 1)), Q::ONE);
-        // ∫_{0,5} κ_1² = ∫_{0,7} ψ_6²ψ_7² = 4!/(2!·2!) = 6
-        assert_eq!(int0(5, &(&kpw(1, 1) * &kpw(1, 1))), Q::from(6));
+        // ∫_{0,5} κ_1² = ∫_{0,7} ψ_6²ψ_7² − ∫_{0,6} ψ_6³ = 6 − 1 = 5
+        // （π_*(ψ_6²ψ_7²) = κ_1² + κ_2，κ 乘积不能逐因子换成 ψ）
+        assert_eq!(int0(5, &(&kpw(1, 1) * &kpw(1, 1))), Q::from(5));
         // ∫_{0,5} κ_2 = ∫_{0,6} ψ_6³ = 3!/3! = 1
         assert_eq!(int0(5, &kpw(2, 1)), Q::ONE);
         // ∫_{0,5} κ_1 ψ_1 = ∫_{0,6} ψ_6²ψ_1 = 3!/2! = 3
@@ -285,27 +271,13 @@ mod tests {
         assert_eq!(int0(3, &kpw(1, 1)), Q::ZERO);
     }
 
-    /// socle 求值（κ 乘积带集合分划修正；过权项记 0）。
-    fn int_socle(g: u32, n: u32, p: &KP) -> Q {
-        use crate::graph::StableGraph;
-        use crate::taut::{DecStratum, TautClass};
-        let legs: Vec<u32> = (1..=n).collect();
-        let graph = StableGraph::new(&[g], &[legs], &[]).unwrap();
-        TautClass::new(vec![DecStratum {
-            graph,
-            poly: p.clone(),
-        }])
-        .evaluate()
-        .unwrap()
-    }
-
     #[test]
     fn pushn_repeated_kappa_indices() {
         // 回归：κ_i^e 按重数展开（二项式权重）后，∫ 恒等式须保持
         // WP 锚点：∫_{0,5}κ₁² = 5，∫_{0,6}κ₁³ = 61，∫_{0,7}κ₁⁴ = 1379
-        assert_eq!(int_socle(0, 5, &kpw(1, 2)), Q::from(5));
-        assert_eq!(int_socle(0, 6, &kpw(1, 3)), Q::from(61));
-        assert_eq!(int_socle(0, 7, &kpw(1, 4)), Q::from(1379));
+        assert_eq!(int0(5, &kpw(1, 2)), Q::from(5));
+        assert_eq!(int0(6, &kpw(1, 3)), Q::from(61));
+        assert_eq!(int0(7, &kpw(1, 4)), Q::from(1379));
         // (0,7) 顶权 4；(0,8) 顶权 5
         let cases: Vec<(u32, KP)> = vec![
             (7, kpw(1, 4)),
@@ -317,11 +289,7 @@ mod tests {
         ];
         for (n, p) in &cases {
             let q = pushn(0, *n, p).unwrap();
-            assert_eq!(
-                int_socle(0, *n, p),
-                int_socle(0, n - 1, &q),
-                "n={n} p={p:?}"
-            );
+            assert_eq!(int0(*n, p), int0(n - 1, &q), "n={n} p={p:?}");
         }
     }
 }
