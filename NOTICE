@@ -29,6 +29,10 @@ restructured and extended, October 2026) of the following works:
   -> crates/sc-faber (graph.rs, kppoly.rs, taut.rs, generators.rs, socle.rs,
      dr.rs, classes.rs, witten.rs, grr.rs follow the corresponding admcycles
      modules)
+  -> crates/sc-faber/tests/data/admcycles_hodge.txt (test data extracted
+     from admcycles/data/hodge_data.sage, commit e1e53753: J. Schmitt,
+     Z. Sun, "Computed data for Hodge integrals and Jacobian locus
+     coefficients", 2026)
 
 The following research programs, distributed publicly by their authors
 without an explicit license, were ported to Rust (the algorithms and the
