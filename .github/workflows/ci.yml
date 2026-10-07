@@ -72,7 +72,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv 自 v8 起不再发布 v10 这类浮动主版本标签，须写完整版本号
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
