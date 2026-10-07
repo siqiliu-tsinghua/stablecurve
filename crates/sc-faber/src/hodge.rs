@@ -204,8 +204,13 @@ fn int_class_inner(
         return cls.evaluate();
     }
     for &(c, _) in ch {
-        if c % 2 == 0 || c + 1 > 2 * g {
-            return Err(format!("ch_{c} 在 g={g} 无定义（仅奇 ch ≤ 2g−1）"));
+        if c % 2 == 0 {
+            return Err(format!("ch_{c} 无定义（Hodge 丛只用奇数次 ch）"));
+        }
+        // ch_c(E) = 0（c ≥ 2g）。Mumford 递归把 ch 分到低亏格分支时会出现这种
+        // 项（如 λ_g² 型单项式），原先报错；admcycles 的 Hodge 数据给出 0。
+        if c + 1 > 2 * g {
+            return Ok(Q::ZERO);
         }
     }
     if g == 1 {
@@ -563,6 +568,25 @@ mod tests {
             klp(8, 0, &[], &[], &[(1, 21)], &[]).unwrap(),
             Q::from_signeds(38176003213i64, 5746615875)
         );
+    }
+
+    /// 回归：递归把 ch_c 分到亏格 h < (c+1)/2 的分支时该项为 0（ch_c(E) = 0，
+    /// c ≥ 2h），原先报"ch_7 在 g=3 无定义"。λ_g² = 0（Mumford）型单项式即
+    /// 触发此路径；admcycles 数据：∫_{M̄_7} λ_4λ_7² = ∫_{M̄_8} λ_5λ_8² = 0。
+    #[test]
+    fn high_ch_on_low_genus_branch_vanishes() {
+        assert_eq!(
+            klp(7, 0, &[], &[], &[(4, 1), (7, 2)], &[]).unwrap(),
+            Q::ZERO
+        );
+        assert_eq!(
+            klp(8, 0, &[], &[], &[(5, 1), (8, 2)], &[]).unwrap(),
+            Q::ZERO
+        );
+        // 直接输入：ch_9 在 M̄_4 上为 0；偶数次 ch 仍报错
+        assert_eq!(klp(4, 0, &[], &[], &[], &[(9, 1)]).unwrap(), Q::ZERO);
+        // （偶数次须用顶权输入才走到检查：非顶权在入口即记 0）
+        assert!(klp(2, 1, &[], &[(1, 2)], &[], &[(2, 1)]).is_err());
     }
 
     /// 回归：非顶权含 λ 输入必须为 0（曾返回垃圾值，admcycles 差分发现）。
