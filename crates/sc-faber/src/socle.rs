@@ -22,6 +22,8 @@ thread_local! {
 static L2: std::sync::OnceLock<std::sync::Mutex<Option<rusqlite::Connection>>> =
     std::sync::OnceLock::new();
 
+/// 缓存值的算法版本，与 crate 版本号无关：只在 st/ic 缓存值的语义变化时
+/// 更新（旧库随之作废）。0.2.0 的改动不改变这些值，故沿用。
 const ALGO_VERSION: &str = "sc-faber 0.1.0";
 
 fn l2() -> &'static std::sync::Mutex<Option<rusqlite::Connection>> {

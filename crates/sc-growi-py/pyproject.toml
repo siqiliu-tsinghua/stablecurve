@@ -1,6 +1,6 @@
 [project]
 name = "sc-growi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Gromov-Witten invariants of P^n and hypersurfaces (Rust port of GROWI)"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"

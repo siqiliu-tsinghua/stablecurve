@@ -13,7 +13,7 @@ name = "_sc_faber"
 crate-type = ["cdylib"]
 
 [dependencies]
-faber = { path = "../sc-faber", version = "0.1.0", package = "sc-faber" }
+faber = { path = "../sc-faber", version = "0.2.0", package = "sc-faber" }
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
 
 [build-dependencies]

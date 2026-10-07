@@ -1,6 +1,6 @@
 [project]
 name = "sc-gwall"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Gromov-Witten and BPS invariants of curves (Rust port of GWall)"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"

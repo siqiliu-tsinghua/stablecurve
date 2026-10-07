@@ -13,7 +13,7 @@ name = "_sc_growi"
 crate-type = ["cdylib"]
 
 [dependencies]
-sc-growi = { path = "../sc-growi", version = "0.1.0" }
+sc-growi = { path = "../sc-growi", version = "0.2.0" }
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
 
 [build-dependencies]

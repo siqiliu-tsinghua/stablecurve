@@ -8,7 +8,7 @@ repository.workspace = true
 description = "模空间 M̄_{g,n} 重言代数内核（Faber Numbers 的现代 Rust 重实现）"
 
 [dependencies]
-sc-num = { path = "../sc-num", version = "0.1.0" }
+sc-num = { path = "../sc-num", version = "0.2.0" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [lints]

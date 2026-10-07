@@ -3,4 +3,4 @@
 from ._sc_faber import FABER
 
 __all__ = ["FABER"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
