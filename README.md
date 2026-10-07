@@ -2,6 +2,8 @@ English | [中文](README.zh-CN.md)
 
 # stablecurve
 
+[![CI](https://github.com/siqiliu-tsinghua/stablecurve/actions/workflows/ci.yml/badge.svg)](https://github.com/siqiliu-tsinghua/stablecurve/actions/workflows/ci.yml)
+
 A Rust workspace of three computational algebraic-geometry engines sharing a
 common rational-number layer (`sc-num`):
 
@@ -22,33 +24,29 @@ common rational-number layer (`sc-num`):
 ```bash
 uv sync                          # builds and installs the Python modules sc_growi / sc_faber / sc_gwall
 cargo build --release            # CLI binaries target/release/{growi,faber,gwall}
-uv run pytest                    # 21 Python tests
+uv run pytest                    # Python tests
 # The Rust workspace also builds the pyo3 crates, which need a Python >= 3.12:
 export PYO3_PYTHON="$PWD/.venv/Scripts/python.exe"   # Windows; elsewhere .venv/bin/python
-cargo test --workspace --release # 164 Rust tests
+cargo test --workspace --release # Rust tests
 ```
 
 All three engines have passed their "golden-number" acceptance: GROWI
 against every one of the 41 assertions of gwcheck.cm (cold start 4.3 s,
 about 40× the original); faber against Faber's *Instructions* examples and
-admcycles differentials (all seven parity items completed); gwall against
-all 121 numeric cells of the local BPS tables (n₂–n₅) in the
-Bryan–Pandharipande paper, 4 of which correct misprints in the paper, and
-against the paper's closed results for g = 0 and g = 1.
+admcycles differentials (all seven parity items completed), and against
+all 53159 λ-monomial Hodge integrals on M̄_g (g ≤ 14) in the admcycles
+data set; gwall against all 121 numeric cells of the local BPS tables
+(n₂–n₅) in the Bryan–Pandharipande paper, 4 of which correct misprints in
+the paper, and against the paper's closed results for g = 0 and g = 1.
 See the acceptance records in each design document for details.
 
-**Tested platforms (v0.1.0).** The full Rust test suite, the Python tests
-(both via wheel installation and via `uv sync`), the gwcheck acceptance
-suite and the growi↔faber cross-check all pass on:
-
-| platform | Rust | Python |
-|---|---|---|
-| Windows 11, x86_64 | 1.99 | 3.12 |
-| Debian 13 (Linux), x86_64 | 1.85.1 (Debian's packaged `rustc`) | 3.12, 3.13 |
-| macOS 26.7, x86_64 (Intel) | 1.85.1 and 1.99 | 3.12 |
-
-Apple Silicon (arm64) has not been tested. The project has no CI; these
-results were obtained manually before release.
+**Continuous integration.** Every push is tested on GitHub Actions
+([`ci.yml`](.github/workflows/ci.yml)) on Linux (x86_64), macOS (Apple
+Silicon) and Windows (x86_64): the full Rust test suite with Rust stable and
+with the minimum supported version 1.85, rustfmt and clippy, the Python
+tests, the gwcheck acceptance suite and the growi↔faber cross-check.
+v0.1.0 was tested manually before release on Windows 11, Debian 13
+(rustc 1.85.1) and macOS 26.7 (Intel).
 
 ## License
 

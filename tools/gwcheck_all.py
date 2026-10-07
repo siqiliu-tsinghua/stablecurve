@@ -101,6 +101,8 @@ def main():
     print("最慢 5 条：")
     for (dt, expr) in times[:5]:
         print(f"  {dt:7.2f}s  {expr}")
+    if fail:
+        raise SystemExit(1)  # 供 CI 判定
 
 
 if __name__ == "__main__":

@@ -1,0 +1,82 @@
+# 持续集成：Linux / macOS / Windows 三平台。
+#   lint    rustfmt 与 clippy（警告即失败）
+#   rust    cargo test --workspace --release，stable 与 MSRV 1.85
+#   python  uv sync 构建三个扩展，pytest，GROWI gwcheck 41 条，growi ↔ faber 交叉验证
+# sc-faber 的 admcycles 差分由 crates/sc-faber/tests/admcycles_hodge.rs（随 rust 作业）
+# 完成，数据已入库，不需要 Sage。
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 验收脚本输出中文；Windows 下重定向的标准输出缺省不是 UTF-8
+  PYTHONUTF8: "1"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # pyo3 的构建脚本要找到 Python ≥ 3.12（abi3-py312）
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+  rust:
+    name: rust ${{ matrix.rust }} / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, "1.85"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+
+  python:
+    name: python / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - run: uv sync
+      - run: uv run pytest -q
+      - run: uv run python tools/gwcheck_all.py "${{ runner.temp }}/gwcheck.sqlite"
+      - run: uv run python tools/cross_growi_faber.py

@@ -2,6 +2,8 @@
 
 # stablecurve
 
+[![CI](https://github.com/siqiliu-tsinghua/stablecurve/actions/workflows/ci.yml/badge.svg)](https://github.com/siqiliu-tsinghua/stablecurve/actions/workflows/ci.yml)
+
 三个代数几何计算引擎的 Rust 工作区，共用有理数层（`sc-num`）：
 
 | crate | 内容 | 前身 |
@@ -21,30 +23,26 @@
 ```bash
 uv sync                          # 构建并安装 Python 模块 sc_growi / sc_faber / sc_gwall
 cargo build --release            # CLI 二进制 target/release/{growi,faber,gwall}
-uv run pytest                    # Python 测试 21 项
+uv run pytest                    # Python 测试
 # Rust 工作区同时构建 pyo3 crate，需要 Python ≥ 3.12：
 export PYO3_PYTHON="$PWD/.venv/Scripts/python.exe"   # Windows；其他平台 .venv/bin/python
-cargo test --workspace --release # Rust 测试 164 项
+cargo test --workspace --release # Rust 测试
 ```
 
 三引擎均已通过各自"黄金数字"验收：GROWI 对照 gwcheck.cm 全部 41 条
 断言（冷启动 4.3s，约 40× 原版）；faber 对照 Faber《Instructions》与
-admcycles 差分（对标增量一档七项全部完成）；gwall 对照 Bryan–
+admcycles 差分（对标增量一档七项全部完成），以及 admcycles 数据集中
+M̄_g（g ≤ 14）上全部 53159 个 λ 单项式 Hodge 积分；gwall 对照 Bryan–
 Pandharipande 论文 local BPS 表（n₂–n₅）全部 121 个数值格（其中 4 格
 订正论文印刷错误），以及论文给出的 g = 0、g = 1 完整结果。详见各设计
 文档的验收记录。
 
-**实测平台（v0.1.0）。** 全部 Rust 测试、Python 测试（wheel 安装与
-`uv sync` 两条路径）、gwcheck 验收与 growi↔faber 交叉验证在以下平台
-全部通过：
-
-| 平台 | Rust | Python |
-|---|---|---|
-| Windows 11，x86_64 | 1.99 | 3.12 |
-| Debian 13（Linux），x86_64 | 1.85.1（Debian 自带 `rustc`） | 3.12、3.13 |
-| macOS 26.7，x86_64（Intel） | 1.85.1 与 1.99 | 3.12 |
-
-Apple Silicon（arm64）未测试。本项目没有 CI，以上结果为发布前人工验证。
+**持续集成。** 每次推送都在 GitHub Actions 上测试
+（[`ci.yml`](.github/workflows/ci.yml)），覆盖 Linux（x86_64）、macOS
+（Apple Silicon）与 Windows（x86_64）：全部 Rust 测试（Rust stable 与最低
+支持版本 1.85）、rustfmt 与 clippy、Python 测试、gwcheck 验收与
+growi↔faber 交叉验证。v0.1.0 发布前曾在 Windows 11、Debian 13
+（rustc 1.85.1）与 macOS 26.7（Intel）上人工验证。
 
 ## 许可证
 
