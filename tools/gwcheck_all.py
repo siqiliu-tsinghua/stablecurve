@@ -80,6 +80,7 @@ def main():
     times = []
     for (expr, expected) in CASES:
         t0 = time.time()
+        err = None
         try:
             got = g.gw(expr)
         except Exception as e:  # noqa: BLE001
@@ -94,7 +95,7 @@ def main():
         else:
             fail += 1
         print(f"[{mark:>4}] {dt:7.2f}s  {expr}")
-        print(f"          got {got}  want {want}" + (f"  ERR {err}" if got is None and 'err' in dir() else ""))
+        print(f"          got {got}  want {want}" + (f"  ERR {err}" if err else ""))
     total = time.time() - t_all
     print(f"\n== {ok}/{len(CASES)} 通过，{fail} 失败，总耗时 {total:.1f}s ==")
     times.sort(reverse=True)

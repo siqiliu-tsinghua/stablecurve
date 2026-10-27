@@ -6,11 +6,13 @@
     =  ∫_{M̄_{0,d+m}} ψ₁^{a₁}···ψ_m^{a_m}   （faber klp(g=0) 独立计算）
 合法组合：Σaᵢ = d+m−3（重言维度匹配；GROWI 侧表现为查询维度校验）。
 """
-import itertools
 from fractions import Fraction
 
 from sc_growi import GROWI
 from sc_faber import FABER
+
+# 预定的比较项数：dim 3..6 × m 1..3 的全部合法 ψ 指数组成
+EXPECTED = 34
 
 
 def compositions(total: int, parts: int):
@@ -49,7 +51,8 @@ def main():
                     fails.append((expr, gv, fv))
                     print(f"[FAIL] {expr}\n        growi={gv} faber={fv}")
     print(f"\n== 交叉 {ok} 通过 / {fail} 失败 / {skipped} 跳过 ==")
-    if fails:
+    # 供 CI 判定：失败或跳过都不算通过，且须恰好比较了 EXPECTED 项
+    if fails or skipped or ok != EXPECTED:
         raise SystemExit(1)
 
 
