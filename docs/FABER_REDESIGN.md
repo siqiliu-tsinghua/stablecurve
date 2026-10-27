@@ -324,6 +324,10 @@ g=2 A=(2,) 五非零（κ₃=11/1920 等）+ 弱 0 例若干，全部与 oracle 
 h0 负幂、aut 双乘）全部被锚点当场截获；腿因子 a = A_i(m) 不减 ψ 幂由 oracle
 两序置换实验定案。
 
+**0.2.1 订正**：ΣC 的整数性检查与 ΣC 本身曾直接把各分子相加（未按 lcm 通分），
+C 的分母不全相同时或被误拒、或静默算错 ΣC 与类的次数（锚点的分母恰好相同）；
+现按通分后求和，并以"同一组 C 换一种分数写法结果不变"的测试把关。
+
 **kval**：dr_chiodo 的 k-twist 一直在（Θ 用 k=−1），drpoly/drspin 差分含 k=1
 例；CLI op：drpoly/drspin/witten/hyperell/biell。
 
@@ -331,7 +335,7 @@ h0 负幂、aut 双乘）全部被锚点当场截获；腿因子 a = A_i(m) 不�
 
 **grr.rs（PRvZ20 Theorem 1，admcycles/GRRcomp.py 移植）**——广义 Hodge Chern
 类 ch_t(R^•π_* O(D))，D = lK̃ + Σd_iσ_i + Σa_{h,S}C_{h,S}：
-- todd_inv_sigma（自环 ×½ + 分离 ×1，decsum 二项式和）+ todd_inv_exp_graphs
+- todd_inv_sigma（自环 ×½ + 分离 ×1，decsum = Σ(−ψ)^iψ'^{t−1−i}）+ todd_inv_exp_graphs
   三分支链图（严格更大 L+2 / 相等 L / irreducible ×½）+ todd_inv_exp；
 - chern_exp/Kin/Sin（链图 + κ@末顶点（子空间 κ_0 = 2g'−2+n'）/ (−ψ_p)^{β−1}
   + p∈Scomp 过滤）+ chern_single = K+S+todd⁻¹，度 t 截断；
@@ -345,6 +349,13 @@ chern_single 三图、λ₁ 四项、twist doctest）+ 差分 18 例（两批 to
 （外层统一乘，锚点 a=−1 显形）、aut 口径（push = aut×oracle 展示值——差分
 1/48 vs 1/24 截获）、comps(k=0) 下溢。**λ_deg≥2 需 TautClass 一般乘法（图积）
 ——归入二档**（λ₁ = ch₁ 已覆盖）。
+
+**0.2.1 订正**：decsum 与链图尾段的 Σ(−ψ)^iψ'^{t−1−i} 曾被写成
+Σ −ψ^iψ'^{t−1−i}（i 为偶数时符号错），t ≥ 3 的 ch_t 全部受影响；上面的锚点
+与差分只覆盖 t ≤ 2，因而没有截获。现由两项一致性测试把关：无扭曲时 grr
+（l = 0、1）与 klp 的 ch_t 一致（t ≤ 7），以及 Serre 对偶
+(l, d, a) ↔ (1−l, −d, −a)。注意 Serre 对偶对这个错误不敏感（修正前也成立），
+真正截获它的是与 klp 的对照。
 
 **一档完成**：Hain ✓、Θ ✓、kval ✓、spin DR ✓（15 例）、Hyperell/Biell ✓
 （33 例）、Witten r-旋 ✓（27 锚点+差分）、GRRcomp ✓（24 锚点+例）。

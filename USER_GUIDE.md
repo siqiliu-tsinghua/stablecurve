@@ -26,8 +26,10 @@ number (blank lines are skipped).
 
 ## 1. sc-growi — GW invariants (GROWI port)
 
-Computes Gromov-Witten invariants of P^n and hypersurfaces (including the
-quintic Calabi–Yau threefold), at any genus, with relative conditions.
+Computes Gromov-Witten invariants of P^n (no fixed genus bound) and of
+hypersurfaces (including the quintic Calabi–Yau threefold; positive genus
+with E > 1 only partly supported, as in the original — see §1.3), with
+relative conditions.
 
 ### 1.1 Expression syntax (direct port of the original `expr.cc`)
 
@@ -82,7 +84,7 @@ during computation.
 
 ---
 
-## 2. sc-faber — tautological-algebra integrals (Faber Numbers port + admcycles parity)
+## 2. sc-faber — tautological-algebra integrals (Faber Numbers port + seven selected admcycles features)
 
 Computes integrals of tautological classes over M̄_{g,n}: mixed κ/ψ/λ/ch
 monomials, DR cycles (Pixton/Chiodo, k-twist, spin), the Θ class, the Hain

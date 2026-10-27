@@ -23,8 +23,9 @@
 
 ## 1. sc-growi——GW 不变量（GROWI 移植）
 
-计算 P^n、超曲面（含五次 Calabi–Yau 三维流形）与相对条件下任意亏格的
-Gromov-Witten 不变量。
+计算 P^n（无固定亏格上限）与超曲面（含五次 Calabi–Yau 三维流形；E > 1 的
+正亏格只部分支持，与原版相同，见 §1.3）的 Gromov-Witten 不变量，可带
+相对条件。
 
 ### 1.1 表达式语法（原版 `expr.cc` 直译）
 
@@ -74,7 +75,7 @@ g.gw("G=2,D=5 in P^4 thru H^3*psi^22")       # Fraction(-41369, 110075314176)
 
 ---
 
-## 2. sc-faber——重言代数积分（Faber Numbers 移植 + admcycles 对标）
+## 2. sc-faber——重言代数积分（Faber Numbers 移植 + admcycles 选定的七项功能）
 
 计算 M̄_{g,n} 上的重言类积分：κ/ψ/λ/ch 混合单项式、DR cycle
 （Pixton/Chiodo、k-twist、spin）、Θ 类、Hain 除子、超椭圆/双椭圆轨迹、
