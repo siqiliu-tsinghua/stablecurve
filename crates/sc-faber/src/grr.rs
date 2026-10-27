@@ -221,7 +221,7 @@ fn todd_inv_sigma(t: u32, g: u32, n: u32) -> TautClass {
         for i in 0..t {
             let mut term = kp_one(numvert);
             if i > 0 {
-                let neg = psi_pow(numvert, n + 1, i).scale(&Q::from(-1));
+                let neg = psi_pow(numvert, n + 1, i).scale(&q_powi(-1, i));
                 term = kp_mul(&term, &neg);
             }
             if t - 1 - i > 0 {
@@ -304,7 +304,7 @@ fn psi_tail(nv: usize, left: u32, right: u32, t1: u32) -> KP {
     for j in 0..t1 {
         let mut term = kp_one(nv);
         if j > 0 {
-            term = kp_mul(&term, &psi_pow(nv, left, j).scale(&Q::from(-1)));
+            term = kp_mul(&term, &psi_pow(nv, left, j).scale(&q_powi(-1, j)));
         }
         if t1 - 1 - j > 0 {
             term = kp_mul(&term, &psi_pow(nv, right, t1 - 1 - j));
@@ -1058,6 +1058,70 @@ mod tests {
             a,
             vec![(0, vec![1, 2], -10), (1, vec![1], -9), (1, vec![1, 2], -16),]
         );
+    }
+
+    /// 两个入口算同一个类：无扭曲时 Rπ_*ω = E − O、Rπ_*O = O − E^∨，奇 t 的
+    /// ch_t 都等于 ch_t(E)，须与 klp 的 Mumford 递归（已与 admcycles 的 53159
+    /// 条 Hodge 积分逐条一致）相同。覆盖 t ≥ 3：0.2.1 前 Σ(−ψ)^iψ'^{t−1−i}
+    /// 被写成 Σ −ψ^iψ'^{t−1−i}，而原有测试与差分只到 t ≤ 2。
+    #[test]
+    fn grr_matches_klp_hodge_ch() {
+        use crate::classes::int_against;
+        use crate::hodge::klp;
+        type Case = (u32, u32, u32, &'static [(u32, u32)], &'static [(u32, u32)]);
+        let cases: [Case; 9] = [
+            (2, 1, 1, &[], &[(1, 3)]),
+            (2, 1, 3, &[], &[(1, 1)]),
+            (2, 2, 3, &[], &[(1, 1), (2, 1)]),
+            (2, 1, 3, &[(1, 1)], &[]),
+            (3, 1, 3, &[], &[(1, 4)]),
+            (3, 1, 5, &[], &[(1, 2)]),
+            (3, 1, 5, &[(1, 1)], &[(1, 1)]),
+            (3, 2, 5, &[], &[(1, 1), (2, 2)]),
+            (4, 1, 7, &[], &[(1, 3)]),
+        ];
+        for (g, n, t, kap, psi) in cases {
+            let want = klp(g, n, kap, psi, &[], &[(t, 1)]).unwrap();
+            assert_ne!(want, Q::ZERO);
+            for l in [1, 0] {
+                let d = vec![0; n as usize];
+                let cl = generalized_hodge_chern_single(t, l, &d, &[], g, n).unwrap();
+                assert_eq!(
+                    int_against(&cl, kap, psi).unwrap(),
+                    want,
+                    "g={g} n={n} t={t} l={l} κ={kap:?} ψ={psi:?}"
+                );
+            }
+        }
+    }
+
+    /// Serre 对偶：ch_t(Rπ_*O(D)) = (−1)^{t+1} ch_t(Rπ_*O(K̃ − D))，即
+    /// (l, d, a) ↔ (1−l, −d, −a)。覆盖一般的扭曲参数。
+    #[test]
+    fn grr_serre_duality() {
+        use crate::classes::int_against;
+        type Case = (u32, u32, u32, i64, Vec<i64>, Vec<ATriple>, Vec<(u32, u32)>);
+        let cases: Vec<Case> = vec![
+            (2, 1, 3, 2, vec![1], vec![], vec![(1, 1)]),
+            (2, 2, 3, 1, vec![1, -1], vec![], vec![(1, 1), (2, 1)]),
+            (2, 2, 3, 0, vec![2, -1], vec![(1, vec![1], 1)], vec![(1, 2)]),
+            (3, 1, 5, 2, vec![1], vec![(1, vec![1], -1)], vec![(1, 2)]),
+        ];
+        for (g, n, t, l, d, a, psi) in cases {
+            let ev = |l: i64, d: &[i64], a: &[ATriple]| {
+                let cl = generalized_hodge_chern_single(t, l, d, a, g, n).unwrap();
+                int_against(&cl, &[], &psi).unwrap()
+            };
+            let lhs = ev(l, &d, &a);
+            let dual_d: Vec<i64> = d.iter().map(|x| -x).collect();
+            let dual_a: Vec<ATriple> = a.iter().map(|(h, s, v)| (*h, s.clone(), -v)).collect();
+            assert_ne!(lhs, Q::ZERO);
+            assert_eq!(
+                lhs,
+                q_powi(-1, t + 1) * ev(1 - l, &dual_d, &dual_a),
+                "g={g} n={n} t={t} l={l} d={d:?} a={a:?}"
+            );
+        }
     }
 
     #[test]
