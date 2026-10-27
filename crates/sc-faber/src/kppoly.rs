@@ -11,10 +11,11 @@
 //! 一致、腿号一致），跨图乘法需要图粘合，在 M3 实现。
 
 use sc_num::{One, Q, is_zero};
-use std::cmp::Ordering;
 
 /// 单项式：系数 + (逐顶点 κ 分划, 逐腿 ψ 幂)。
-#[derive(Clone, Debug)]
+///
+/// `==` 是完整相等（含系数）；合并同类项只比较键，见 [`KappaPsiPolynomial::new`]。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KpTerm {
     pub kappa: Vec<Vec<u32>>, // kappa[v]：顶点 v 的 κ 指标，升序
     pub psi: Vec<(u32, u32)>, // (腿号, 幂)，按腿号升序，幂 ≥ 1
@@ -37,24 +38,6 @@ impl KpTerm {
             .iter()
             .find(|&&(lg, _)| lg == l)
             .map_or(0, |&(_, p)| p)
-    }
-}
-
-// 项的比较只看键（κ, ψ）：规范形保证同键项已合并，系数不参与序。
-impl PartialEq for KpTerm {
-    fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
-    }
-}
-impl Eq for KpTerm {}
-impl PartialOrd for KpTerm {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for KpTerm {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key().cmp(&other.key())
     }
 }
 
@@ -101,10 +84,10 @@ impl KappaPsiPolynomial {
                 t
             })
             .collect();
-        ts.sort();
+        ts.sort_by(|a, b| a.key().cmp(&b.key()));
         let mut merged: Vec<KpTerm> = Vec::with_capacity(ts.len());
         for t in ts {
-            if merged.last().map(|m| m == &t).unwrap_or(false) {
+            if merged.last().is_some_and(|m| m.key() == t.key()) {
                 merged.last_mut().unwrap().coeff += &t.coeff;
             } else {
                 merged.push(t);
@@ -285,6 +268,27 @@ mod tests {
             coeff: q(1),
         }]);
         assert_eq!(p.terms[0].psi, vec![(2, 3)]);
+    }
+
+    /// `==` 是含系数的完整相等（0.2.1 前只比较键，2 倍的多项式与原式"相等"）；
+    /// 合并同类项仍只看键。
+    #[test]
+    fn equality_includes_coefficients() {
+        let one = KappaPsiPolynomial::one();
+        assert_ne!(one, one.scale(&q(2)));
+        let t = |c: i64| KpTerm {
+            kappa: vec![vec![1]],
+            psi: vec![(1, 2)],
+            coeff: q(c),
+        };
+        assert_eq!(
+            KappaPsiPolynomial::new(vec![t(1), t(2)]),
+            KappaPsiPolynomial::new(vec![t(3)])
+        );
+        assert_ne!(
+            KappaPsiPolynomial::new(vec![t(1)]),
+            KappaPsiPolynomial::new(vec![t(3)])
+        );
     }
 
     #[test]
