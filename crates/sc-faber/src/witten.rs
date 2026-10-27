@@ -357,7 +357,7 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
         }
         step = num_lcm(step, cd);
     }
-    let cnum_sum: i64 = a.iter().map(|&(cn, _, _)| cn).sum();
+    let cnum_sum: i64 = a.iter().map(|&(cn, cd, _)| cn * (step / cd)).sum();
     if cnum_sum % step != 0 {
         return Err("ΣC 须为整数".into());
     }
@@ -575,6 +575,50 @@ mod tests {
             int_against(&w5, &[], &[(1, 3)]).unwrap().to_string(),
             "1/1920"
         );
+    }
+
+    /// 同一组 C 换一种分数写法，结果不变（0.2.1 前 ΣC 直接把分子相加：混合
+    /// 分母或被误拒，或静默算错 ΣC 与类的次数）。
+    #[test]
+    fn witten_rational_representation_invariant() {
+        use crate::classes::int_against;
+        let ev = |g: u32, a: &[(i64, i64, i64)], psi: &[(u32, u32)]| {
+            int_against(&witten_class(g, a).unwrap(), &[], psi).unwrap()
+        };
+        // w2 锚点 C = (0, 1/2, 1/2) 的另外两种写法
+        let psi = [(1, 1), (2, 1)];
+        let w = ev(1, &[(0, 1, 3), (1, 2, -1), (1, 2, -2)], &psi);
+        assert_eq!(w.to_string(), "-1/2");
+        assert_eq!(ev(1, &[(0, 3, 3), (1, 2, -1), (1, 2, -2)], &psi), w);
+        assert_eq!(ev(1, &[(0, 1, 3), (2, 4, -1), (1, 2, -2)], &psi), w);
+        // C = (1/2, 1/3, 1/6)：曾报"ΣC 须为整数"
+        let w = ev(0, &[(1, 2, 0), (1, 3, 0), (1, 6, -2)], &[]);
+        assert_ne!(w, Q::ZERO);
+        assert_eq!(ev(0, &[(3, 6, 0), (2, 6, 0), (1, 6, -2)], &[]), w);
+        // C = (1/4, 3/4, 1/2, 1/2, 1/2, 1/2)：分子和 8 恰被 lcm 4 整除，曾把
+        // ΣC = 3 算成 2，积分静默为 0
+        let w = ev(
+            0,
+            &[
+                (1, 4, 0),
+                (3, 4, 0),
+                (1, 2, 0),
+                (1, 2, 0),
+                (1, 2, -1),
+                (1, 2, -1),
+            ],
+            &[(1, 1)],
+        );
+        assert_ne!(w, Q::ZERO);
+        let same = [
+            (1, 4, 0),
+            (3, 4, 0),
+            (2, 4, 0),
+            (2, 4, 0),
+            (2, 4, -1),
+            (2, 4, -1),
+        ];
+        assert_eq!(ev(0, &same, &[(1, 1)]), w);
     }
 
     #[test]
