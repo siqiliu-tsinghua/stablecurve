@@ -76,12 +76,21 @@ impl Cache {
     }
 
     /// 批量落盘 dirty 队列（单事务）。
+    ///
+    /// 写回失败（busy_timeout 之后仍失败，多为磁盘满、只读或库损坏）时打印
+    /// 警告并卸下 L2：本会话的结果仍在 L1，只是不再持久化。
     pub fn flush(&mut self) {
         if self.dirty.is_empty() {
             return;
         }
         if let Some(db) = self.db.as_mut() {
-            let _ = db.store_batch(&self.dirty);
+            if let Err(e) = db.store_batch(&self.dirty) {
+                eprintln!(
+                    "sc-growi: 缓存写回失败（{e}），{} 条结果未保存；本会话停用持久缓存",
+                    self.dirty.len()
+                );
+                self.db = None;
+            }
         }
         self.dirty.clear();
     }
@@ -229,6 +238,23 @@ mod tests {
         // 新进程（新 Cache 实例）应从 L2 读到
         let mut c2 = Cache::with_db(&path).unwrap();
         assert_eq!(c2.get(&lines_p2()), Some(crate::num::q_frac(-1, 12)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写回失败不静默：卸下 L2（可见），结果仍留在 L1。
+    #[test]
+    fn failed_flush_detaches_l2() {
+        let dir = std::env::temp_dir().join("sc-growi-test-cache-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Cache::with_db(&dir.join("cache.sqlite")).unwrap();
+        let db = c.db.as_ref().unwrap();
+        db.conn.execute("DROP TABLE invariants", []).unwrap();
+        c.put(lines_p2(), Q::from(1));
+        c.flush();
+        assert!(c.db.is_none());
+        assert_eq!(c.get(&lines_p2()), Some(Q::from(1)));
+        drop(c);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

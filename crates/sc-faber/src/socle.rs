@@ -47,6 +47,9 @@ pub fn attach_cache(path: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
+    // 多进程共用缓存文件时短暂的锁竞争由 SQLite 等待，不当作写入失败
+    conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(|e| e.to_string())?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS st (
             k BLOB PRIMARY KEY,
@@ -100,10 +103,15 @@ fn l2_put_raw(key: Vec<u8>, val: &Q) {
     let Some(conn) = guard.as_mut() else { return };
     let s = val.to_string();
     let (n, d) = s.split_once('/').unwrap_or((s.as_str(), "1"));
-    let _ = conn.execute(
+    // 写入失败须可见：警告并卸下 L2（结果仍在进程内记忆化里，只是不再持久化；
+    // cache_attached 随之为 false）
+    if let Err(e) = conn.execute(
         "INSERT OR REPLACE INTO st (k, v) VALUES (?1, ?2)",
         rusqlite::params![key, format!("{n}/{d}")],
-    );
+    ) {
+        eprintln!("sc-faber: 缓存写入失败（{e}），本进程停用持久缓存");
+        *guard = None;
+    }
 }
 
 /// 通用 L2 读取（跨模块共用同一张表，按 kind 前缀区分）。
