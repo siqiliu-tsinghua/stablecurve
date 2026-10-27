@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "sc-faber"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusqlite",
  "sc-num",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "sc-faber-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sc-faber",
  "serde",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "sc-faber-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "sc-growi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusqlite",
  "sc-num",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "sc-growi-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sc-growi",
  "serde_json",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "sc-growi-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -424,14 +424,14 @@ dependencies = [
 
 [[package]]
 name = "sc-gwall"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sc-num",
 ]
 
 [[package]]
 name = "sc-gwall-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sc-gwall",
  "sc-num",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "sc-gwall-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "sc-num"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "malachite-base",
  "malachite-q",

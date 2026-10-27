@@ -8,7 +8,7 @@ repository.workspace = true
 description = "光滑曲线的（不连通）Gromov-Witten 不变量（Jim Bryan GWall 的 Rust 移植）"
 
 [dependencies]
-sc-num = { path = "../sc-num", version = "0.2.0" }
+sc-num = { path = "../sc-num", version = "0.2.1" }
 
 [lints]
 workspace = true

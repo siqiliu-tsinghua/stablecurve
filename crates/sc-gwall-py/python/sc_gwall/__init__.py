@@ -10,4 +10,4 @@
 from ._sc_gwall import GWALL
 
 __all__ = ["GWALL"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

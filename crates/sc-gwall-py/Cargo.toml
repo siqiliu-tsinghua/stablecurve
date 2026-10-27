@@ -13,8 +13,8 @@ name = "_sc_gwall"
 crate-type = ["cdylib"]
 
 [dependencies]
-sc-gwall = { path = "../sc-gwall", version = "0.2.0" }
-sc-num = { path = "../sc-num", version = "0.2.0" }
+sc-gwall = { path = "../sc-gwall", version = "0.2.1" }
+sc-num = { path = "../sc-num", version = "0.2.1" }
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py312"] }
 
 [build-dependencies]
