@@ -66,6 +66,9 @@ impl Mono {
 
     /// 由任意 (变量, 指数) 集合构造规范形：合并同变量指数、剔除零指数、
     /// 按规范序排列。
+    ///
+    /// 合并后指数超过 255（u8）时 panic，不截断也不丢项；调用方须先检查
+    /// 次数（查询解析器按 `MAX_EXP` 预检）。乘法 [`Mono::mul_mono`] 同此。
     pub fn from_pairs<I: IntoIterator<Item = (Var, u8)>>(pairs: I) -> Self {
         let mut acc: Vec<(Var, u32)> = Vec::new();
         for (v, e) in pairs {
@@ -77,7 +80,9 @@ impl Mono {
                 None => acc.push((v, e as u32)),
             }
         }
-        acc.retain(|&(_, e)| e > 0 && e <= u8::MAX as u32);
+        if let Some(&(v, e)) = acc.iter().find(|&&(_, e)| e > u8::MAX as u32) {
+            panic!("单项式指数溢出：{v}^{e} 超出 u8（≤ 255）");
+        }
         // 规范序 = 原版 cmp：变量降序
         acc.sort_by_key(|a| std::cmp::Reverse(a.0));
         Mono {
@@ -422,6 +427,13 @@ mod tests {
         let d = m.div_mono(&Mono::from_pairs([(Var::H, 2)])).unwrap();
         assert_eq!(d.to_string(), "H");
         assert!(m.div_mono(&Mono::from_pairs([(Var::H, 4)])).is_none());
+    }
+
+    /// 指数溢出 u8 须报错，不得静默丢掉变量（H^200·H^100 曾变成 1）。
+    #[test]
+    #[should_panic(expected = "单项式指数溢出")]
+    fn mono_exponent_overflow_panics() {
+        let _ = Mono::from_pairs([(Var::H, 200), (Var::H, 100)]);
     }
 
     #[test]
