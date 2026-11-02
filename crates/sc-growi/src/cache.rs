@@ -18,7 +18,7 @@ use crate::num::Q;
 /// 键格式版本；编码语义变化时 +1，旧库自动作废。
 const KEY_FORMAT_VERSION: u8 = 1;
 /// 算法版本；策略链行为变化时更新，防止旧值污染新算法。
-const ALGO_VERSION: &str = "sc-growi 0.1.0";
+const ALGO_VERSION: &str = "sc-growi 0.2.1 primitive-pairing";
 /// dirty 队列达到此长度即落盘。
 const DIRTY_LIMIT: usize = 4096;
 
@@ -66,6 +66,10 @@ impl Cache {
     pub fn put(&mut self, inv: Inv, value: Q) {
         if crate::env_flag("SC_GROWI_KEYS") {
             eprintln!("[key] {inv} = {value}");
+        }
+        if self.db.is_none() {
+            self.l1.insert(inv, value);
+            return;
         }
         if self.l1.insert(inv.clone(), value.clone()).is_none() {
             self.dirty.push((inv, value));

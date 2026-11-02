@@ -5,6 +5,7 @@
 
 use crate::graph::StableGraph;
 use crate::kppoly::{KappaPsiPolynomial, KpTerm};
+use sc_num::One;
 use sc_num::{Q, Zero};
 
 /// 装饰 stratum：稳定图 + 其上的 κ-ψ 多项式。
@@ -118,7 +119,7 @@ impl TautClass {
         use crate::socle::socle_formula;
         let mut acc = Q::ZERO;
         for t in &self.terms {
-            let aut_inv = Q::from_signeds(1, t.graph.automorphism_number() as i64);
+            let aut_inv = Q::ONE / t.graph.automorphism_number();
             for term in &t.poly.terms {
                 let mut v = term.coeff.clone() * &aut_inv;
                 for (vi, vtx) in t.graph.vertices().iter().enumerate() {

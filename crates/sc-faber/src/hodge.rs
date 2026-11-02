@@ -1,7 +1,7 @@
-//! λ 与 ch 类的积分。纯 λ-ψ 输入走直接后代递归；含 κ/ch 的输入保留
-//! Faber `klp/klmgn` 路线。
+//! κ、λ、ch 与 ψ 类的积分。klp 先用带符号集合分划把 κ 化为后代，
+//! 再走 Mumford GRR 的直接后代递归。int_class 保留 Faber 旧路线供对照。
 //!
-//! 含 κ/ch 的路线（KaLa5）：
+//! int_class 的旧路线（KaLa5）：
 //! - λ_i 按 Mumford 生成函数展开为奇 ch：
 //!   `λ_n = [t^n] exp( Σ_i ch_{2i−1}·(2i−2)!·t^{2i−1} )`（偶 ch 在 M_g 消没）；
 //! - g=1 带一个 ch₁：恒等式 1/24·∫_{M̄_{0,n+2}}（类不变、双标记结构）；
@@ -22,6 +22,10 @@ use sc_num::{One, Q, Zero, is_zero};
 
 mod psi;
 
+pub(crate) fn psi_integral(g: u32, powers: &[u32]) -> Q {
+    psi::pure(g, powers)
+}
+
 fn fact(n: u64) -> Q {
     let mut r = Q::ONE;
     for i in 2..=n {
@@ -30,13 +34,13 @@ fn fact(n: u64) -> Q {
     r
 }
 
-fn binom(e: u32, k: u32) -> i64 {
+fn binom(e: u32, k: u32) -> Q {
     if k > e {
-        return 0;
+        return Q::ZERO;
     }
-    let mut r = 1i64;
-    for i in 0..k {
-        r = r * (e - i) as i64 / (i + 1) as i64;
+    let mut r = Q::ONE;
+    for i in 0..k.min(e - k) {
+        r = r * Q::from(e - i) / Q::from(i + 1);
     }
     r
 }
@@ -86,8 +90,35 @@ pub fn lambda_expansion(n: u32) -> Vec<ChMono> {
 }
 
 fn normalize_ch(mut v: Vec<ChMono>) -> Vec<ChMono> {
+    for (mono, _) in &mut v {
+        *mono = normalized_powers(mono);
+    }
+    v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    v.dedup_by(|term, previous| {
+        if term.0 == previous.0 {
+            previous.1 += &term.1;
+            true
+        } else {
+            false
+        }
+    });
     v.retain(|(_, c)| !is_zero(c));
     v
+}
+
+fn normalized_powers(powers: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = powers.to_vec();
+    out.retain(|&(_, p)| p != 0);
+    out.sort_unstable_by_key(|v| v.0);
+    out.dedup_by(|v, prev| {
+        if v.0 == prev.0 {
+            prev.1 = prev.1.checked_add(v.1).expect("指数之和超出 u32");
+            true
+        } else {
+            false
+        }
+    });
+    out
 }
 
 /// ch-多项式相乘。
@@ -134,23 +165,11 @@ pub fn int_class(
 ) -> Result<Q, String> {
     use crate::socle::{cache_get, cache_put};
     // 键规范化：各分量排序，避免同子问题因构造路径不同而 miss
-    let kappa = {
-        let mut v = kappa.to_vec();
-        v.sort_unstable();
-        v
-    };
-    let psi = {
-        let mut v = psi.to_vec();
-        v.sort_unstable();
-        v
-    };
-    let ch = {
-        let mut v = ch.to_vec();
-        v.sort_unstable();
-        v
-    };
+    let kappa = normalized_powers(kappa);
+    let psi = normalized_powers(psi);
+    let ch = normalized_powers(ch);
     // 权重守卫（Faber klmgn 的 sx 检查）：非顶权 → 积分为 0。
-    // 递归内部调用自顶输入而来均为顶权，不受影响；还顺带短路 push 保留的过权 q0 项。
+    // 递归内部调用自顶权输入而来均为顶权，不受影响。
     let w: u32 = kappa.iter().map(|&(i, p)| i * p).sum::<u32>()
         + psi.iter().map(|&(_, p)| p).sum::<u32>()
         + ch.iter().map(|&(c, p)| c * p).sum::<u32>();
@@ -379,7 +398,7 @@ fn dist_rec(
     let mut sum = Q::ZERO;
     for k in 0..=e {
         let c0 = coeff.clone();
-        *coeff *= Q::from(binom(e, k));
+        *coeff *= binom(e, k);
         if k > 0 {
             d.push((kind, index, k));
         }
@@ -449,6 +468,9 @@ pub fn klp(
     // 输入校验：ψ 腿 ⊆ 1..=n（κ 指标 >0 由 fund_poly 保证）；同腿 ψ 幂合并
     crate::kppoly::check_marking_legs(psi, n)?;
     let psi = &crate::kppoly::merge_psi(psi)[..];
+    let kappa = &normalized_powers(kappa)[..];
+    let ch = &normalized_powers(ch)[..];
+    let lambda = &normalized_powers(lambda)[..];
     if 2 * g as i64 - 2 + n as i64 <= 0 {
         return Err(format!("M̄_({g},{n}) 不稳定"));
     }
@@ -462,28 +484,78 @@ pub fn klp(
     if kappa.is_empty() && ch.is_empty() {
         return Ok(psi::integrate(g, n, psi, lambda));
     }
-    // λ → ch
-    let mut ch_poly: Vec<ChMono> = vec![(vec![], Q::ONE)];
-    for &(l, p) in lambda {
-        let e = lambda_expansion(l);
-        for _ in 0..p {
-            ch_poly = ch_mul(&ch_poly, &e);
+    if kappa.iter().any(|&(i, _)| i == 0) {
+        return Err("κ_0 无定义".into());
+    }
+    let weight = kappa
+        .iter()
+        .chain(lambda)
+        .chain(ch)
+        .map(|&(i, p)| u64::from(i) * u64::from(p))
+        .sum::<u64>()
+        + psi.iter().map(|&(_, p)| u64::from(p)).sum::<u64>();
+    if weight as i64 != 3 * i64::from(g) - 3 + i64::from(n) {
+        return Ok(Q::ZERO);
+    }
+    for &(c, _) in ch {
+        if c % 2 == 0 {
+            return Err(format!("ch_{c} 无定义（Hodge 丛只用奇数次 ch）"));
+        }
+        if u64::from(c) >= 2 * u64::from(g) {
+            return Ok(Q::ZERO);
         }
     }
-    for &(c, p) in ch {
-        ch_poly = ch_mul(&ch_poly, &[(vec![(c, p)], Q::ONE)]);
-    }
-    let mut acc = Q::ZERO;
-    for (mono, c) in &ch_poly {
-        let v = int_class(g, n, kappa, psi, mono)?;
-        acc += c * v;
-    }
-    Ok(acc)
+    Ok(psi::integrate_mixed(g, n, kappa, psi, lambda, ch))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_powers_and_duplicate_factors() {
+        let expected = Q::from_signeds(1, 24);
+        assert_eq!(klp(1, 1, &[], &[(1, 1)], &[], &[(1, 0)]).unwrap(), expected);
+        assert_eq!(
+            int_class(1, 1, &[], &[(1, 1)], &[(1, 0)]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            klp(2, 0, &[], &[], &[(1, 1), (1, 2)], &[]).unwrap(),
+            klp(2, 0, &[], &[], &[(1, 3)], &[]).unwrap()
+        );
+        assert_eq!(binom(62, 28), Q::from(349615716557887465i64));
+    }
+
+    #[test]
+    fn mixed_direct_recursion_matches_legacy_grr() {
+        for g in 1..=3 {
+            for n in 1..=2 {
+                let dimension = 3 * g - 3 + n;
+                for k in 0..=3.min(dimension) {
+                    for l in 0..=g.min(dimension - k) {
+                        for c in 0..=2.min(dimension - k - l) {
+                            let kappa = if k == 0 { vec![] } else { vec![(1, k)] };
+                            let lambda = if l == 0 { vec![] } else { vec![(l, 1)] };
+                            let ch = if c == 0 { vec![] } else { vec![(1, c)] };
+                            let psi = vec![(1, dimension - k - l - c)];
+                            let expansion = ch_mul(&lambda_expansion(l), &[(ch.clone(), Q::ONE)]);
+                            let mut expected = Q::ZERO;
+                            for (mono, coefficient) in expansion {
+                                expected +=
+                                    coefficient * int_class(g, n, &kappa, &psi, &mono).unwrap();
+                            }
+                            assert_eq!(
+                                klp(g, n, &kappa, &psi, &lambda, &ch).unwrap(),
+                                expected,
+                                "g={g} n={n} k={k} l={l} ch1={c}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Instructions（Faber 2004）的全部数值例——M4 验收。
     #[test]

@@ -125,13 +125,21 @@ impl PairSplit {
         hw: i16,
         vdiag: usize,
     ) -> (Inv, Inv) {
-        let mut a = hdr_v.clone();
-        a.cdeg = dv;
-        a.pts = self.v[..self.vn].to_vec().into();
+        let mut a = Inv::new(
+            hdr_v.dim,
+            hdr_v.deg,
+            hdr_v.genus,
+            dv,
+            self.v[..self.vn].to_vec(),
+        );
         a.pts[vdiag] = Pdata::new(hv, 0, 0);
-        let mut b = hdr_w.clone();
-        b.cdeg = dw_deg;
-        b.pts = self.w[..self.wn].to_vec().into();
+        let mut b = Inv::new(
+            hdr_w.dim,
+            hdr_w.deg,
+            hdr_w.genus,
+            dw_deg,
+            self.w[..self.wn].to_vec(),
+        );
         b.pts[0] = Pdata::new(hw, 0, 0);
         (a, b)
     }

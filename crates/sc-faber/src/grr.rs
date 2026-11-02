@@ -514,6 +514,9 @@ fn chern_exp(t: u32, a: &[ATriple], g: u32, n: u32) -> TautClass {
         let (genera, labels, edges) = chain_parts(n, g, &atn, &[n + 2 * l as u32]);
         let nv = genera.len();
         let mut poly = chain_psi_head(nv, n, &tvn, l - 1);
+        for (ai, &power) in atn[..l - 1].iter().zip(&tvn) {
+            poly = poly.scale(&q_powi(ai.2, power));
+        }
         // a^{tv}(−1)^{tv−1} Σ_{j<tv−1} C(tv−1,j) ψ_{n+2L−1}^j ψ_{n+2L}^{tv−1−j−1}
         let lp = n + 2 * l as u32 - 1;
         let rp = n + 2 * l as u32;
@@ -660,7 +663,25 @@ fn hodge_chern_unmerged(
         return Err("d 长度须为 n".into());
     }
     let mut asort: Vec<ATriple> = a.to_vec();
-    asort.sort_by(|x, y| x.1.cmp(&y.1).then(x.2.cmp(&y.2)));
+    for (h, s, _) in &mut asort {
+        if *h > g || s.iter().any(|&p| p == 0 || p > n) {
+            return Err("边界项的亏格或标记超出范围".into());
+        }
+        s.sort_unstable();
+        s.dedup();
+    }
+    // 链顺序由 (h,S) 决定，与除子的系数无关。
+    asort.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    let mut merged: Vec<ATriple> = Vec::new();
+    for (h, s, c) in asort {
+        if let Some(last) = merged.last_mut().filter(|v| v.0 == h && v.1 == s) {
+            last.2 = last.2.checked_add(c).ok_or("边界系数之和超出 i64")?;
+        } else {
+            merged.push((h, s, c));
+        }
+    }
+    merged.retain(|v| v.2 != 0);
+    let asort = merged;
     let mut parts: Vec<TautClass> = Vec::new();
     for alpha in 0..=t + 1 {
         let beta = t + 1 - alpha;
@@ -738,7 +759,7 @@ fn merge_isomorphic(cl: &TautClass) -> TautClass {
     let mut terms: Vec<DecStratum> = Vec::new();
     for (_, (mut ds, c)) in acc {
         if c != Q::ZERO {
-            let aut = Q::from(ds.graph.automorphism_number() as i64);
+            let aut = ds.graph.automorphism_number();
             for t in ds.poly.terms.iter_mut() {
                 t.coeff = c.clone() * aut.clone();
             }
@@ -768,6 +789,42 @@ pub fn generalized_hodge_chern(
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn boundary_coefficients_are_polynomial_and_zero_is_neutral() {
+        let eval = |a: &[ATriple]| {
+            crate::classes::int_against(
+                &generalized_hodge_chern_single(2, 0, &[0, 0], a, 2, 2).unwrap(),
+                &[(1, 3)],
+                &[],
+            )
+            .unwrap()
+        };
+        let base = eval(&[(1, vec![1, 2], 1)]);
+        assert_eq!(base, Q::from_signeds(41, 384));
+        assert_eq!(base, eval(&[(0, vec![1, 2], 0), (1, vec![1, 2], 1)]));
+        // ch_2 是除子系数的至多三次多项式，四阶差分恒为零。
+        let mut values: Vec<_> = (-4..=4)
+            .map(|x| eval(&[(0, vec![1, 2], x), (1, vec![1, 2], 1)]))
+            .collect();
+        for _ in 0..4 {
+            values = values.windows(2).map(|w| &w[1] - &w[0]).collect();
+        }
+        assert!(values.iter().all(|v| *v == Q::ZERO));
+        // 两条边的链中，C_0 C_1² / 2 的几何交数为 −1/128。
+        let chain = chern_exp(2, &[(0, vec![1, 2], 2), (1, vec![1, 2], 3)], 2, 2);
+        let chain = TautClass::new(
+            chain
+                .terms
+                .into_iter()
+                .filter(|t| t.graph.codim() == 2)
+                .collect(),
+        );
+        assert_eq!(
+            crate::classes::int_against(&chain, &[(1, 3)], &[]).unwrap(),
+            Q::from_signeds(-18, 128)
+        );
+    }
 
     /// 回归：不同构但颜色多重集相同的两个图不被合并（旧键会把 4-圈与
     /// "三角形 + 悬挂点" 合为一项）；同构的两种写法合并、系数相加。
@@ -805,14 +862,14 @@ mod merge_tests {
         ]));
         assert_eq!(merged.terms.len(), 2);
         // 系数口径：合并后的系数和 × 代表图的 |Aut|（4-圈为二面体群，8 阶）
-        assert_eq!(c1.automorphism_number(), 8);
+        assert_eq!(c1.automorphism_number(), Q::from(8));
         for t in &merged.terms {
             let expect = if t.graph == tadpole {
-                tadpole.automorphism_number() as i64
+                tadpole.automorphism_number()
             } else {
-                3 * 8
+                Q::from(3 * 8)
             };
-            assert_eq!(t.poly.terms[0].coeff, Q::from(expect), "{}", t.graph);
+            assert_eq!(t.poly.terms[0].coeff, expect, "{}", t.graph);
         }
     }
 }
@@ -835,9 +892,7 @@ mod merge_consistency {
                 .iter()
                 .map(|ds| DecStratum {
                     graph: ds.graph.clone(),
-                    poly: ds
-                        .poly
-                        .scale(&Q::from(ds.graph.automorphism_number() as i64)),
+                    poly: ds.poly.scale(&ds.graph.automorphism_number()),
                 })
                 .collect(),
         );

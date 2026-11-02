@@ -30,6 +30,67 @@ pub fn q_frac(n: i64, d: i64) -> Q {
     Q::from_signeds(n, d)
 }
 
+/// 精确阶乘表，按所需最大指标逐步延长。
+pub fn factorial(n: u32) -> Q {
+    thread_local! {
+        static TABLE: std::cell::RefCell<Vec<Q>> = std::cell::RefCell::new(vec![Q::ONE]);
+    }
+    TABLE.with(|cell| {
+        let mut table = cell.borrow_mut();
+        while table.len() <= n as usize {
+            let next = table.last().unwrap() * Q::from(table.len());
+            table.push(next);
+        }
+        table[n as usize].clone()
+    })
+}
+
+/// 精确二项式；中间乘积同样使用任意精度。
+pub fn binomial(n: u32, k: u32) -> Q {
+    if k > n {
+        return Q::ZERO;
+    }
+    (0..k.min(n - k)).fold(Q::ONE, |v, j| v * Q::from(n - j) / Q::from(j + 1))
+}
+
+/// Bernoulli 数，B₁ = −1/2。每行的二项系数用相邻比递推。
+pub fn bernoulli(n: u64) -> Q {
+    thread_local! {
+        static TABLE: std::cell::RefCell<Vec<Q>> = std::cell::RefCell::new(vec![Q::ONE]);
+    }
+    let n = usize::try_from(n).expect("Bernoulli 指标超出 usize");
+    TABLE.with(|cell| {
+        let mut b = cell.borrow_mut();
+        while b.len() <= n {
+            let m = b.len();
+            let mut coefficient = Q::ONE;
+            let mut sum = Q::ZERO;
+            for (k, bk) in b.iter().enumerate() {
+                sum += &coefficient * bk;
+                coefficient = coefficient * Q::from(m + 1 - k) / Q::from(k + 1);
+            }
+            b.push(-sum / Q::from(m + 1));
+        }
+        b[n].clone()
+    })
+}
+
+/// 平方求幂，不缩窄指数。
+pub fn pow_unsigned(base: &Q, mut exponent: u64) -> Q {
+    let mut base = base.clone();
+    let mut value = Q::ONE;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            value *= &base;
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base = &base * &base;
+        }
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

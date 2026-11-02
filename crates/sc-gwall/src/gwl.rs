@@ -33,6 +33,7 @@ pub struct Ctx {
     pub fast: bool,
     /// (g, d) → (已算 Z 级数, 其截断阶)——pf 层跨调用复用（扩大截断时重算）
     pub zmem: std::collections::HashMap<(u32, u32), (Vec<Q>, u32)>,
+    pub(crate) lmem: std::collections::BTreeMap<u32, (u32, Vec<crate::qseries::QSeries>)>,
 }
 
 impl Ctx {
@@ -41,6 +42,7 @@ impl Ctx {
             mem: HashMap::new(),
             fast: true,
             zmem: std::collections::HashMap::new(),
+            lmem: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -52,11 +54,7 @@ impl Default for Ctx {
 }
 
 fn fact(n: u32) -> Q {
-    let mut v = Q::ONE;
-    for i in 2..=n {
-        v *= Q::from(i as i64);
-    }
-    v
+    sc_num::factorial(n)
 }
 
 fn binom(n: u32, k: u32) -> Q {
@@ -728,6 +726,12 @@ pub fn gw(g: u32, d: u32, insert: &[Ins]) -> Q {
 /// （GWall 文档的约定），环路后代反交换，交错输入按把 a 逐个移过其前面的
 /// b 所需的对换数取符号；偶类插入与一切交换，不影响符号。
 pub fn gw_ctx(ctx: &mut Ctx, g: u32, d: u32, insert: &[Ins]) -> Q {
+    if insert
+        .iter()
+        .any(|ins| matches!(ins, Ins::A(_, i) | Ins::B(_, i) if *i == 0 || *i > g))
+    {
+        return Q::ZERO;
+    }
     let mut omega_degree = 2 * g as i64 - 2;
     let (mut t1, mut ta, mut tb, mut tp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut to, mut th) = (Vec::new(), Vec::new());
@@ -759,6 +763,14 @@ pub fn gw_ctx(ctx: &mut Ctx, g: u32, d: u32, insert: &[Ins]) -> Q {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_loop_index_cannot_disappear_in_string_recursion() {
+        for i in [0, 2] {
+            assert_eq!(gw(1, 1, &[Ins::T1(0), Ins::A(0, i), Ins::B(0, i)]), Q::ZERO);
+        }
+        assert_eq!(gw(1, 1, &[Ins::T1(0), Ins::A(0, 1), Ins::B(0, 1)]), Q::ONE);
+    }
 
     /// String 方程（L_{−1} 的数学内容）强独立检验：
     /// ⟨τ_0(1)·X⟩ = Σ_x ⟨X|τ_x 降一阶⟩——右侧不含 τ(1)，直达闭式层。

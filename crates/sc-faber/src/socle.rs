@@ -148,21 +148,7 @@ fn binom(n: u64, k: u64) -> Q {
 /// 生成函数递推：Σ_{k=0}^{m} C(m+1,k) B_k = 0（m ≥ 1）。表按需延长并缓存：
 /// Bernoulli 多项式等调用方逐个取 B_0..B_n，每次从头递推会叠成 O(n⁴)。
 pub fn bernoulli(n: u64) -> Q {
-    thread_local! {
-        static TABLE: RefCell<Vec<Q>> = RefCell::new(vec![Q::ONE]);
-    }
-    TABLE.with(|t| {
-        let mut b = t.borrow_mut();
-        while b.len() <= n as usize {
-            let m = b.len();
-            let mut acc = Q::ZERO;
-            for (k, bk) in b.iter().enumerate() {
-                acc += binom(m as u64 + 1, k as u64) * bk;
-            }
-            b.push(-acc / Q::from(m as i64 + 1));
-        }
-        b[n as usize].clone()
-    })
+    sc_num::bernoulli(n)
 }
 
 /// 有理数幂（指数可为负）。
@@ -473,7 +459,18 @@ pub fn socle_formula(g: u32, psilist: &[u32], kappalist: &[u32]) -> Result<Q, St
     if g == 0 {
         return Ok(ct_const(0) * ct_sum(psilist, kappalist));
     }
-    Ok(st_sum(psilist, kappalist))
+    let mut total = Q::ZERO;
+    for (blocks, multiplicity) in setparts_with_auts(kappalist) {
+        let mut arg = psilist.to_vec();
+        arg.extend(blocks.iter().map(|b| 1 + b.iter().sum::<u32>()));
+        let value = multiplicity * crate::hodge::psi_integral(g, &arg);
+        if (kappalist.len() - blocks.len()) % 2 == 0 {
+            total += value;
+        } else {
+            total -= value;
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

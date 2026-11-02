@@ -7,7 +7,9 @@
 //! −T[d1]。权重和 mod (m−1)；插值点步长 step = lcm(C_i 分母)；P(0) 拉格朗日；
 //! 整体 ×(−1)^{d−g}。
 
-use crate::generators::tautgens;
+use crate::flow::{FlowTopology, ZeroInterpolator};
+use crate::generators::visit_tautgens;
+use crate::graph::StableGraph;
 use crate::kppoly::{KappaPsiPolynomial as KP, KpTerm};
 use crate::socle::bernoulli;
 use crate::taut::{DecStratum, TautClass};
@@ -342,13 +344,47 @@ fn num_gcd(a: i64, b: i64) -> i64 {
 /// ≡ 0 mod (m−1)；v(m) = total·(m−1)^{−h₀}·scalar(m)；插值点步长
 /// step = lcm(C 分母)，P(0) 拉格朗日，整体 ×(−1)^{d−g}（d = g−1+ΣC）。
 pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> {
+    let mut terms = Vec::new();
+    visit_witten(g, a, None, &mut |graph, poly| {
+        terms.push(DecStratum {
+            graph: graph.clone(),
+            poly,
+        });
+        Ok(())
+    })?;
+    Ok(TautClass::new(terms))
+}
+
+/// Witten 类与 κ-ψ 的积分；避免构造完整装饰类。
+pub fn int_witten(
+    g: u32,
+    a: &[(i64, i64, i64)],
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+) -> Result<Q, String> {
+    crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
+    let mut pairing = crate::classes::Pairing::new(kappa, psi);
+    let mut total = Q::ZERO;
+    visit_witten(g, a, Some(psi), &mut |graph, poly| {
+        total += pairing.evaluate(graph, &poly)?;
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+fn visit_witten(
+    g: u32,
+    a: &[(i64, i64, i64)],
+    external_psi: Option<&[(u32, u32)]>,
+    emit: &mut impl FnMut(&StableGraph, KP) -> Result<(), String>,
+) -> Result<(), String> {
     let n = a.len() as u32;
     let dsum: i64 = a.iter().map(|&(_, _, d)| d).sum();
     if dsum != 2 * g as i64 - 2 {
         return Err(format!("ΣD={dsum} ≠ 2g−2={}", 2 * g as i64 - 2));
     }
     if a.iter().any(|&(cn, cd, d)| cn == cd && d == -1) {
-        return Ok(TautClass::default());
+        return Ok(());
     }
     let mut step: i64 = 1;
     for &(_, cd, _) in a {
@@ -366,31 +402,33 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
     let abs_d: i64 = a.iter().map(|&(_, _, d)| d.abs()).sum();
     let m0 = ((abs_d + 1) / 2 + g as i64 + 1) * step;
 
-    let mut terms: Vec<DecStratum> = Vec::new();
-    for gs in tautgens(g, n, d_deg) {
-        let graph = &gs.graph;
+    let interpolators: Vec<_> = (0..=d_deg)
+        .map(|s| ZeroInterpolator::new(m0 + step, step, 2 * s as usize + 1))
+        .collect();
+    let mut prepared: Option<(StableGraph, FlowTopology)> = None;
+    visit_tautgens(g, n, d_deg, external_psi, &mut |graph, poly| {
         let nv = graph.vertices().len();
-        let t = &gs.poly.terms[0];
+        let t = &poly.terms[0];
         let ne = graph.edges().len();
         let h0 = ne as i64 - nv as i64 + 1;
         // 边表（顶点对 + 半边 ψ 幂）
-        let leg_vertex = |l: u32| -> usize {
-            graph
-                .vertices()
-                .iter()
-                .position(|v| v.legs.contains(&l))
-                .unwrap()
-        };
+        let owner = graph.leg_owner();
         let mut edges_v: Vec<(usize, usize)> = Vec::new();
         let mut exps: Vec<(u32, u32)> = Vec::new();
         for &(ea, eb) in graph.edges() {
-            edges_v.push((leg_vertex(ea), leg_vertex(eb)));
+            edges_v.push((owner[ea as usize], owner[eb as usize]));
             exps.push((t.psi_power_at(ea), t.psi_power_at(eb)));
         }
         let exp_sum: u32 = exps.iter().map(|&(e1, e2)| e1 + e2).sum();
         let deg = 2 * exp_sum as i64 + 2 * ne as i64;
         let npts = deg as usize + 1;
-        let mut pts: Vec<i64> = Vec::with_capacity(npts);
+        if prepared
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != graph)
+        {
+            prepared = Some((graph.clone(), FlowTopology::new(&edges_v, nv)));
+        }
+        let topology = &prepared.as_ref().unwrap().1;
         let mut vals: Vec<Q> = Vec::with_capacity(npts);
         // scalar 在 X=0 处的符号因子值（腿/κ 因子不参与插值——参考
         // interp(X)·scalar(X) 结构：插值只对 total·(m−1)^{−h0}）
@@ -405,42 +443,42 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
             let e = t.psi_power_at(l);
             scalar0 *= leg_factor(e, dd, 0);
         }
+        if scalar0 == Q::ZERO {
+            return Ok(());
+        }
+        let mut base: Vec<i64> = graph
+            .vertices()
+            .iter()
+            .zip(&t.kappa)
+            .map(|(v, kap)| 1 - v.genus as i64 - kap.iter().map(|&i| i as i64).sum::<i64>())
+            .collect();
+        let mut slope = vec![0i64; nv];
+        for (li, &(cn, cd, dd)) in a.iter().enumerate() {
+            let vi = owner[li + 1];
+            base[vi] += dd - t.psi_power_at(li as u32 + 1) as i64;
+            slope[vi] += cn * (step / cd);
+        }
+        for (&(_, v), &(e1, e2)) in edges_v.iter().zip(&exps) {
+            base[v] -= 2 + e1 as i64 + e2 as i64;
+        }
         for i in 0..npts {
             let m = m0 + step * (i as i64 + 1);
             // given 权重与 scalar（每 m 重算）
             // 给定权初值 = 1 − g_v（Pixton M[i,0][0] = genus；g=1 主图
             // 锚点反推验证接受条件成立）
-            let mut given: Vec<i64> = graph
-                .vertices()
+            let given: Vec<i64> = base
                 .iter()
-                .map(|v| 1 - v.genus as i64)
+                .zip(&slope)
+                .map(|(&b, &s)| b + s * (m / step))
                 .collect();
-            for (gv, kv) in given.iter_mut().zip(&t.kappa) {
-                // kappa 列表 = 指标多重集，每个出现即幂 1
-                *gv -= kv.iter().map(|&idx| idx as i64).sum::<i64>();
-            }
-            for (li, &(cn, cd, dd)) in a.iter().enumerate().take(n as usize) {
-                let l = li as u32 + 1;
-                let vi = graph
-                    .vertices()
-                    .iter()
-                    .position(|v| v.legs.contains(&l))
-                    .ok_or(format!("标记 {l} 不在图中"))?;
-                let e = t.psi_power_at(l) as i64;
-                let ai_m = cn * m / cd + dd; // step | m 保证整除
-                given[vi] += ai_m - e;
-            }
             // 边权枚举 mod (m−1)：起点 += x、终点 −= x+2+e₁+e₂。常数部分
             // 并入给定值，剩下的 ±x 即平衡流；边因子按 x ∈ 0..m−1 制表
             // （同 (e₁, e₂) 的边共用一张表）
             let mm = m - 1;
-            for (&(_, v), &(e1, e2)) in edges_v.iter().zip(&exps) {
-                given[v] -= 2 + e1 as i64 + e2 as i64;
-            }
             let tables: Vec<std::rc::Rc<Vec<Q>>> =
                 exps.iter().map(|&(e1, e2)| edge_table(e1, e2, m)).collect();
             let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
-            let total = crate::flow::balanced_flow_sum(&edges_v, &given, mm, &table);
+            let total = topology.sum(&given, mm, &table);
             // total·(m−1)^{−h0}：参考 mvalues.append(total * ZZ(m-1)**(-h0))
             let mut mpow = Q::ONE;
             for _ in 0..h0 {
@@ -449,20 +487,10 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
             for _ in 0..(-h0) {
                 mpow *= Q::from(mm);
             }
-            pts.push(m);
             vals.push(total * mpow);
         }
         // 拉格朗日 P(0)
-        let mut p0 = Q::ZERO;
-        for i in 0..npts {
-            let mut wt = Q::ONE;
-            for j in 0..npts {
-                if i != j {
-                    wt = wt * Q::from(-pts[j]) / Q::from(pts[i] - pts[j]);
-                }
-            }
-            p0 += vals[i].clone() * wt;
-        }
+        let p0 = interpolators[exp_sum as usize + ne].evaluate(&vals);
         let sgn = Q::from(if ((d_deg as i64 - g as i64) % 2 + 2) % 2 == 0 {
             1
         } else {
@@ -472,22 +500,36 @@ pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> 
         if coeff != Q::ZERO {
             // coeff = mpoly(0)·sgn 已是类系数口径（= aut × oracle 生成元
             // 系数）；evaluate 统一除 aut，勿在此再乘
-            terms.push(DecStratum {
-                graph: graph.clone(),
-                poly: KP::new(vec![KpTerm {
+            emit(
+                graph,
+                KP::new(vec![KpTerm {
                     kappa: t.kappa.clone(),
                     psi: t.psi.clone(),
                     coeff,
                 }]),
-            });
+            )?;
         }
-    }
-    Ok(TautClass::new(terms))
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_integrals_match_complete_classes() {
+        for g in 1..=3 {
+            let a = [(0, 1, 2 * i64::from(g) - 2)];
+            let cls = witten_class(g, &a).unwrap();
+            for p in 0..=2 {
+                let kappa = [(1, p)];
+                let psi = [(1, (2 * g - 1).saturating_sub(p))];
+                let expected = crate::classes::int_against(&cls, &kappa, &psi).unwrap();
+                assert_eq!(int_witten(g, &a, &kappa, &psi).unwrap(), expected);
+            }
+        }
+    }
 
     #[test]
     fn bernoulli_convention() {

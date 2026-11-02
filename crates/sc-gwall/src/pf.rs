@@ -191,25 +191,40 @@ pub fn y_series(ctx: &mut Ctx, g: u32, d: u32, n: u32) -> Result<QSeries, String
 /// 论文表的 N^h_d(g) 从 L_d 读（M4 悬案根因之二：初版直读 disconnected
 /// 的 Z 系数——n_2^1(2) 因误差相消侥幸通过，g≥3 暴露）。
 pub fn l_series(ctx: &mut Ctx, g: u32, d: u32, n: u32) -> Result<QSeries, String> {
-    // 逐度递推（t 截断 n）
-    let mut l: Vec<QSeries> = Vec::with_capacity(d as usize + 1);
-    for dd in 0..=d {
-        if dd == 0 {
-            l.push(QSeries::constant(Q::ONE, n));
-            continue;
+    if let Some((precision, rows)) = ctx.lmem.get(&g) {
+        if *precision >= n && rows.len() > d as usize {
+            return Ok(rows[d as usize].trunc(n));
         }
-        let zd = z(ctx, g, dd, n)?;
+    }
+    let mut l = match ctx.lmem.remove(&g) {
+        Some((precision, rows)) if precision == n => rows,
+        _ => vec![QSeries::constant(Q::ZERO, n)],
+    };
+    // 一次准备所需 Z_d，连通化时直接借用，避免每次卷积复制级数。
+    let zrows = (0..=d)
+        .map(|dd| {
+            if dd == 0 {
+                Ok(QSeries::constant(Q::ONE, n))
+            } else {
+                z(ctx, g, dd, n)
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for dd in l.len() as u32..=d {
+        let zd = &zrows[dd as usize];
         // L_d = Z_d − (1/d)Σ_{j=1..d−1} j·L_j·Z_{d−j}（Z_d 不除 d）
         let mut s = QSeries::constant(Q::ZERO, n);
         for j in 1..dd {
-            let lj = l[j as usize].clone();
-            let zdj = z(ctx, g, dd - j, n)?;
-            s = s.add(&lj.mul(&zdj).scale(&Q::from(j as i64)));
+            let lj = &l[j as usize];
+            let zdj = &zrows[(dd - j) as usize];
+            s = s.add(&lj.mul(zdj).scale(&Q::from(j as i64)));
         }
         let cf = Q::from(-1) / Q::from(dd as i64);
         l.push(zd.add(&s.scale(&cf)));
     }
-    Ok(l[d as usize].clone())
+    let result = l[d as usize].clone();
+    ctx.lmem.insert(g, (n, l));
+    Ok(result)
 }
 
 /// N^h_d(g)：论文表的（连通、reduced）不变量 = L_d 的 t^{2(h−(d−1)(g−1))} 系数。
@@ -297,8 +312,20 @@ pub fn bps_local(ctx: &mut Ctx, g: u32, d: u32, h: u32) -> Result<Q, String> {
             continue;
         }
         let dd = d / k;
+        let kk = h as i64 - (dd as i64 - 1) * (g as i64 - 1);
+        if kk < 0 {
+            continue;
+        }
+        let connected = l_series(ctx, g, dd, (2 * kk) as u32)?;
         for hh in 0..=h {
-            let ncoef = n_reduced(ctx, g, dd, hh)?;
+            let order = hh as i64 - (dd as i64 - 1) * (g as i64 - 1);
+            if order < 0 {
+                continue;
+            }
+            let ncoef = &connected.c[2 * order as usize];
+            if *ncoef == Q::ZERO {
+                continue;
+            }
             // m^{2(g+h')−3}，指数可为负（g=1, h'=0 → m⁻¹）
             let e = 2 * (g + hh) as i64 - 3;
             let mut kp = Q::ONE;
@@ -320,6 +347,14 @@ pub fn bps_local(ctx: &mut Ctx, g: u32, d: u32, h: u32) -> Result<Q, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_degree_zero_vanishes() {
+        assert_eq!(
+            l_series(&mut Ctx::new(), 2, 0, 4).unwrap().c,
+            vec![Q::ZERO; 5]
+        );
+    }
 
     /// branch2 对照原版手写展开：2ch₂ + 2ch₁²（ch = ChL，deg = g−1）。
     #[test]

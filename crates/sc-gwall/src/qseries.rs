@@ -8,35 +8,11 @@ use sc_num::{One, Q, Zero};
 
 /// Bernoulli 数 B_n（B₁ = −1/2）：递推 Σ_{k} C(n+1,k) B_k = 0。
 pub fn bernoulli(n: u32) -> Q {
-    let mut b: Vec<Q> = vec![Q::ONE]; // B_0 = 1
-    for m in 1..=n as usize {
-        // B_m 由 Σ_{k=0..m} C(m+1,k) B_k = 0 解出
-        let mut acc = Q::ZERO;
-        for (k, bk) in b.iter().enumerate() {
-            acc += binom_q(m + 1, k) * bk;
-        }
-        b.push(Q::ZERO - acc / binom_q(m + 1, m));
-    }
-    b[n as usize].clone()
-}
-
-fn binom_q(a: usize, b: usize) -> Q {
-    if b > a {
-        return Q::ZERO;
-    }
-    let mut v = Q::ONE;
-    for i in 0..b {
-        v = v * Q::from((a - i) as i64) / Q::from((b - i) as i64);
-    }
-    v
+    sc_num::bernoulli(u64::from(n))
 }
 
 fn fact(n: u32) -> Q {
-    let mut v = Q::ONE;
-    for i in 2..=n {
-        v *= Q::from(i as i64);
-    }
-    v
+    sc_num::factorial(n)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,13 +125,14 @@ impl QSeries {
     /// 整数幂（可为负；负幂要求常数项非零）。
     pub fn pow_signed(&self, e: i64) -> Result<Self, String> {
         if e >= 0 {
-            Ok(self.powi(e as u32))
+            Ok(self.pow_unsigned(e as u64))
         } else {
-            Ok(self.inverse()?.powi((-e) as u32))
+            Ok(self.inverse()?.pow_unsigned(e.unsigned_abs()))
         }
     }
 
     /// 代换 x ← f(y)（f 常数项须为 0；结果截断到自身阶数）。
+    /// 内层未列出的系数按 0 处理，与 add 的补零约定一致。
     pub fn compose(&self, f: &Self) -> Result<Self, String> {
         let f0 = f.c.first().cloned().unwrap_or(Q::ZERO);
         if f0 != Q::ZERO {
@@ -165,22 +142,35 @@ impl QSeries {
         if n == 0 {
             return Ok(QSeries { c: Vec::new() });
         }
+        let mut inner = f.clone();
+        inner.c.resize(n, Q::ZERO);
         // Horner：S = c_0 + x(c_1 + x(c_2 + ...))，中间保持目标截断长度
         let mut acc = QSeries::constant(self.c.last().cloned().unwrap_or(Q::ZERO), n as u32 - 1);
         for i in (0..n - 1).rev() {
-            acc = QSeries::constant(self.c[i].clone(), n as u32 - 1).add(&acc.mul(f));
+            acc = QSeries::constant(self.c[i].clone(), n as u32 - 1).add(&acc.mul(&inner));
         }
         Ok(acc)
     }
 
     /// 幂 series^k（k ≥ 0 整数幂，截断长度保持与自身一致）。
     pub fn powi(&self, k: u32) -> Self {
+        self.pow_unsigned(u64::from(k))
+    }
+
+    fn pow_unsigned(&self, mut k: u64) -> Self {
         if self.c.is_empty() {
             return QSeries { c: Vec::new() };
         }
         let mut acc = QSeries::constant(Q::ONE, self.c.len() as u32 - 1);
-        for _ in 0..k {
-            acc = acc.mul(self);
+        let mut base = self.clone();
+        while k > 0 {
+            if k & 1 == 1 {
+                acc = acc.mul(&base);
+            }
+            k >>= 1;
+            if k > 0 {
+                base = base.mul(&base);
+            }
         }
         acc
     }
@@ -199,21 +189,39 @@ impl QSeries {
 /// 恒等式：t·e^{t/2}/(e^t−1) = t/(2·sinh(t/2)) 是 Bernoulli 多项式的
 /// 母函数取 x = 1/2，故系数 = B_l(1/2)/l!（奇 l 自动为 0——中心对称）。
 pub fn z_over_2sinh_coeff(l: u32) -> Q {
-    // B_l(1/2) = Σ_k C(l,k) B_k 2^{k−l}
-    let mut acc = Q::ZERO;
-    for k in 0..=l {
-        let mut pow2 = Q::ONE;
-        for _ in 0..(l - k) {
-            pow2 *= Q::from(2);
-        }
-        acc += binom_q(l as usize, k as usize) * bernoulli(k) / pow2;
+    // Bernoulli 倍角恒等式 B_l(1/2) = (2^{1−l}−1) B_l。
+    if l == 0 {
+        return Q::ONE;
     }
-    acc / fact(l)
+    if l % 2 == 1 {
+        return Q::ZERO;
+    }
+    let power = sc_num::pow_unsigned(&Q::from(2), u64::from(l));
+    (Q::from(2) / power - Q::ONE) * bernoulli(l) / fact(l)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composition_keeps_known_powers_of_short_inner_polynomial() {
+        let outer = QSeries {
+            c: vec![Q::ZERO, Q::ZERO, Q::ONE],
+        };
+        let inner = QSeries::var(1);
+        assert_eq!(outer.compose(&inner).unwrap(), outer);
+    }
+
+    #[test]
+    fn signed_powers_keep_all_exponent_bits() {
+        let s = QSeries {
+            c: vec![Q::ONE, Q::ONE],
+        };
+        for e in [1i64 << 32, i64::MAX, i64::MIN, -3, 0, 5] {
+            assert_eq!(s.pow_signed(e).unwrap().c, vec![Q::ONE, Q::from(e)]);
+        }
+    }
 
     fn q(v: i64) -> Q {
         Q::from(v)

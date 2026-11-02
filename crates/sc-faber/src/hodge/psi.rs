@@ -64,8 +64,20 @@ fn integrate_with_threads(
     lambda: &[(u32, u32)],
     threads: usize,
 ) -> Q {
+    integrate_ch_with_threads(g, n, psi, lambda, &[], threads)
+}
+
+fn integrate_ch_with_threads(
+    g: u32,
+    n: u32,
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    explicit_ch: &[(u32, u32)],
+    threads: usize,
+) -> Q {
     let weight = lambda
         .iter()
+        .chain(explicit_ch)
         .map(|&(l, p)| u64::from(l) * u64::from(p))
         .sum::<u64>();
     let psi_weight = psi.iter().map(|&(_, p)| u64::from(p)).sum::<u64>();
@@ -96,7 +108,7 @@ fn integrate_with_threads(
     }
     // λ_g 定理：∫ λ_g Πψ_i^{d_i} = multinomial(d) · (1−2^{1−2g})|B_{2g}|/(2g)!.
     // https://arxiv.org/abs/math/9908052, Theorem 1 and equation (5).
-    if g > 0 && factors == [(g, 1)] {
+    if g > 0 && factors == [(g, 1)] && explicit_ch.is_empty() {
         let mut power = Q::ONE;
         for _ in 0..2 * g - 1 {
             power *= Q::from(2);
@@ -115,7 +127,7 @@ fn integrate_with_threads(
     {
         return Q::ZERO;
     }
-    let mut poly = vec![(vec![], Q::ONE)];
+    let mut poly = vec![(explicit_ch.to_vec(), Q::ONE)];
     for (l, p) in factors {
         let expansion = lambda_expansion(l);
         for _ in 0..p {
@@ -141,6 +153,57 @@ fn integrate_with_threads(
         }
         sum
     })
+}
+
+pub(super) fn pure(g: u32, d: &[u32]) -> Q {
+    DESCENDENTS.with(|cell| cell.borrow_mut().eval(g, d.to_vec(), &[]))
+}
+
+/// κ 的逆推前公式：对位置集合分划求和，每块 B 新增 τ_{1+Σ_{i∈B}κ_i}，
+/// 系数为 (−1)^{κ 的个数−块数}。Hodge 类随忘点映射拉回。
+pub(super) fn integrate_mixed(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+) -> Q {
+    if kappa.is_empty() {
+        return integrate_ch_with_threads(g, n, psi, lambda, ch, 1);
+    }
+    let mut kappalist = Vec::new();
+    for &(index, power) in kappa {
+        kappalist.extend(std::iter::repeat_n(index, power as usize));
+    }
+    // 不同分划可产生相同的后代幂列表；先合并再递归。
+    let mut roots = BTreeMap::<Vec<u32>, Q>::new();
+    for (blocks, multiplicity) in crate::socle::setparts_with_auts(&kappalist) {
+        let mut powers: Vec<u32> = blocks.iter().map(|b| 1 + b.iter().sum::<u32>()).collect();
+        powers.sort_unstable();
+        let coefficient = if (kappalist.len() - blocks.len()) % 2 == 0 {
+            multiplicity
+        } else {
+            -multiplicity
+        };
+        *roots.entry(powers).or_insert(Q::ZERO) += coefficient;
+    }
+    let mut sum = Q::ZERO;
+    for (powers, coefficient) in roots {
+        if coefficient == Q::ZERO {
+            continue;
+        }
+        let mut descendants = psi.to_vec();
+        descendants.extend(
+            powers
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (n + i as u32 + 1, p)),
+        );
+        sum += coefficient
+            * integrate_ch_with_threads(g, n + powers.len() as u32, &descendants, lambda, ch, 1);
+    }
+    sum
 }
 
 fn collect_terms(mut terms: Vec<ChMono>) -> Vec<ChMono> {

@@ -9,6 +9,7 @@
 //! 注意这不是完整的图同构规范形（同构但初始编号不同的图可能编码不同），
 //! 完整规范形在 M1 乘法化简时引入。
 
+use sc_num::{One, Q, Zero};
 use std::fmt;
 
 /// 半边（腿）编号：`1..=n` 为标记，`n+1..` 为结点腿。
@@ -150,7 +151,7 @@ impl StableGraph {
     /// 的 m_uv 条边整体置换（定向由端点决定），u 处 m_uu 个自环置换且各自可
     /// 翻转，共 Π_{u<v} m_uv! · Π_u m_uu!·2^{m_uu}。顶点置换只在细化颜色类内
     /// 回溯（自同构保持细化颜色），逐顶点检查与已指派顶点的边重数相容。
-    pub fn automorphism_number(&self) -> u64 {
+    pub fn automorphism_number(&self) -> Q {
         let n = self.vertices.len();
         let owner = self.leg_owner();
         let mut mult = vec![vec![0u32; n]; n];
@@ -161,43 +162,68 @@ impl StableGraph {
                 mult[v][u] += 1;
             }
         }
-        let fact = |m: u32| (1..=m as u64).product::<u64>();
-        let mut edge_maps: u64 = 1;
+        let fact = |m: u32| (1..=m).fold(Q::ONE, |v, k| v * Q::from(k));
+        let mut edge_maps = Q::ONE;
         for (u, row) in mult.iter().enumerate() {
-            edge_maps *= fact(row[u]) << row[u];
+            edge_maps *= fact(row[u]);
+            for _ in 0..row[u] {
+                edge_maps *= Q::from(2);
+            }
             for &m in &row[u + 1..] {
                 edge_maps *= fact(m);
             }
         }
         let color = self.refined_colors(&mult);
+        let twins: Vec<Vec<bool>> = (0..n)
+            .map(|u| {
+                (0..n)
+                    .map(|v| {
+                        color[u] == color[v]
+                            && mult[u][u] == mult[v][v]
+                            && (0..n).all(|w| w == u || w == v || mult[u][w] == mult[v][w])
+                    })
+                    .collect()
+            })
+            .collect();
         fn count(
             v: usize,
             img: &mut Vec<usize>,
             used: &mut Vec<bool>,
             color: &[usize],
             mult: &[Vec<u32>],
-        ) -> u64 {
+            twins: &[Vec<bool>],
+        ) -> Q {
             let n = color.len();
             if v == n {
-                return 1;
+                return Q::ONE;
             }
-            let mut total = 0;
+            let mut total = Q::ZERO;
             for w in 0..n {
                 if used[w]
                     || color[w] != color[v]
                     || mult[w][w] != mult[v][v]
                     || (0..v).any(|x| mult[v][x] != mult[w][img[x]])
+                    || (0..w).any(|x| !used[x] && twins[w][x])
                 {
                     continue;
                 }
+                // 未用且可相互交换的像顶点给出等数目的延拓，只递归一次。
+                let multiplicity = (0..n).filter(|&x| !used[x] && twins[w][x]).count();
                 used[w] = true;
                 img[v] = w;
-                total += count(v + 1, img, used, color, mult);
+                total += Q::from(multiplicity) * count(v + 1, img, used, color, mult, twins);
                 used[w] = false;
             }
             total
         }
-        count(0, &mut vec![0; n], &mut vec![false; n], &color, &mult) * edge_maps
+        count(
+            0,
+            &mut vec![0; n],
+            &mut vec![false; n],
+            &color,
+            &mult,
+            &twins,
+        ) * edge_maps
     }
 
     /// 顶点颜色的 1 维 Weisfeiler–Leman 细化：初始色 (亏格, 标记集)，逐轮
@@ -356,7 +382,7 @@ impl StableGraph {
     }
 
     /// 腿 → 所在顶点下标（以腿号直接索引；不在任何顶点上为 `usize::MAX`）。
-    fn leg_owner(&self) -> Vec<usize> {
+    pub(crate) fn leg_owner(&self) -> Vec<usize> {
         let max_leg = self
             .vertices
             .iter()
@@ -470,6 +496,26 @@ impl StableGraph {
             }
             orig_pairs.push((u, v));
         }
+        let mut adjacency = vec![vec![0u32; n]; n];
+        for &(u, v) in &orig_pairs {
+            adjacency[u][v] += 1;
+            if u != v {
+                adjacency[v][u] += 1;
+            }
+        }
+        // 交换这两个顶点本身就是自同构时，只搜索一个代表。
+        let twins: Vec<Vec<bool>> = (0..n)
+            .map(|u| {
+                (0..n)
+                    .map(|v| {
+                        colors[u] == colors[v]
+                            && adjacency[u][u] == adjacency[v][v]
+                            && (0..n)
+                                .all(|w| w == u || w == v || adjacency[u][w] == adjacency[v][w])
+                    })
+                    .collect()
+            })
+            .collect();
         // arr[p] = 位于位序 p 的原顶点；pos[v] = 原顶点 v 的位序
         let mut arr = order.clone();
         let mut pos = vec![0usize; n];
@@ -482,10 +528,23 @@ impl StableGraph {
             arr: &mut Vec<usize>,
             pos: &mut Vec<usize>,
             orig_pairs: &[(usize, usize)],
+            twins: &[Vec<bool>],
             cur: &mut Vec<(usize, usize)>,
             best: &mut Vec<(usize, usize)>,
             found: &mut bool,
         ) {
+            if *found && k < arr.len() {
+                // 未安排顶点的位序至少为 k；所得边表是所有后续排列的字典序下界。
+                cur.clear();
+                cur.extend(orig_pairs.iter().map(|&(a, b)| {
+                    let (pa, pb) = (pos[a].min(k), pos[b].min(k));
+                    (pa.min(pb), pa.max(pb))
+                }));
+                cur.sort_unstable();
+                if *cur >= *best {
+                    return;
+                }
+            }
             if k == arr.len() {
                 cur.clear();
                 cur.extend(orig_pairs.iter().map(|&(a, b)| {
@@ -501,10 +560,23 @@ impl StableGraph {
             }
             // 位序 k 取组内尚未安排的任一顶点（交换法枚举组内全排列）
             for i in k..group_end[k] {
+                if (k..i).any(|j| twins[arr[i]][arr[j]]) {
+                    continue;
+                }
                 arr.swap(k, i);
                 pos[arr[k]] = k;
                 pos[arr[i]] = i;
-                search(k + 1, group_end, arr, pos, orig_pairs, cur, best, found);
+                search(
+                    k + 1,
+                    group_end,
+                    arr,
+                    pos,
+                    orig_pairs,
+                    twins,
+                    cur,
+                    best,
+                    found,
+                );
                 arr.swap(k, i);
                 pos[arr[k]] = k;
                 pos[arr[i]] = i;
@@ -519,6 +591,7 @@ impl StableGraph {
             &mut arr,
             &mut pos,
             &orig_pairs,
+            &twins,
             &mut cur,
             &mut pairs,
             &mut found,
@@ -1117,7 +1190,18 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_eq!(a.edges(), &[(3, 4), (5, 6)]);
-        assert_eq!(a.automorphism_number(), 8); // 2!·2²
+        assert_eq!(a.automorphism_number(), Q::from(8)); // 2!·2²
+    }
+
+    #[test]
+    fn automorphisms_exceed_machine_integer() {
+        let legs = (1..=34).collect();
+        let edges: Vec<_> = (0..17).map(|i| (2 * i + 1, 2 * i + 2)).collect();
+        let graph = StableGraph::new(&[0], &[legs], &edges).unwrap();
+        assert_eq!(
+            graph.automorphism_number().to_string(),
+            "46620662575398912000"
+        );
     }
 
     /// 改写后的同构规范化与自同构数，逐图对照改写前的参考实现。
@@ -1136,7 +1220,7 @@ mod tests {
             for gr in crate::generators::graphs_upto(g, n, c) {
                 assert_eq!(
                     gr.automorphism_number(),
-                    automorphism_number_reference(&gr),
+                    Q::from(automorphism_number_reference(&gr)),
                     "{gr}"
                 );
                 for _ in 0..3 {

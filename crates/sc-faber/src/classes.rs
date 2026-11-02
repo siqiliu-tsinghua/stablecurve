@@ -21,7 +21,7 @@ fn delt(g: u32, a: &[i64], l: u32, subset: &[u32]) -> Vec<DecStratum> {
         let i = subset[0];
         return vec![fund_psi(g, n, i, -1)];
     }
-    if l == g && subset.len() == (n - 1) as usize {
+    if l == g && n > 0 && subset.len() == (n - 1) as usize {
         let comp: Vec<u32> = full
             .iter()
             .copied()
@@ -67,7 +67,7 @@ fn fund_psi(g: u32, n: u32, leg: u32, coeff: i64) -> DecStratum {
 /// Hain 除子 D_{g,A}（ΣA = 0）。
 pub fn hain_divisor(g: u32, a: &[i64]) -> Result<TautClass, String> {
     let n = a.len() as u32;
-    if a.iter().sum::<i64>() != 0 {
+    if a.iter().fold(Q::ZERO, |s, &x| s + Q::from(x)) != Q::ZERO {
         return Err(format!("Hain 要求 ΣA = 0，得到 {a:?}"));
     }
     if 2 * g as i64 - 2 + n as i64 <= 0 {
@@ -76,18 +76,20 @@ pub fn hain_divisor(g: u32, a: &[i64]) -> Result<TautClass, String> {
     let mut terms: Vec<DecStratum> = Vec::new();
     let idx: Vec<u32> = (1..=n).collect();
     for l in 0..=g {
-        for mask in 0u64..(1u64 << n) {
+        for mask in crate::generators::subsets(n as usize, false) {
             let subset: Vec<u32> = idx
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| mask & (1 << i) != 0)
+                .filter(|(i, _)| mask[*i])
                 .map(|(_, &x)| x)
                 .collect();
-            let s: i64 = subset.iter().map(|&i| a[(i - 1) as usize]).sum();
+            let s = subset
+                .iter()
+                .fold(Q::ZERO, |s, &i| s + Q::from(a[(i - 1) as usize]));
             for d in delt(g, a, l, &subset) {
                 terms.push(DecStratum {
                     graph: d.graph,
-                    poly: d.poly.scale(&(Q::from_signeds(-1, 4) * Q::from(s * s))),
+                    poly: d.poly.scale(&(Q::from_signeds(-1, 4) * &s * &s)),
                 });
             }
         }
@@ -99,43 +101,73 @@ pub fn hain_divisor(g: u32, a: &[i64]) -> Result<TautClass, String> {
 /// （κ_j 限制到覆盖顶点之和；ψ_i 落其顶点）。
 /// ψ 的腿号须在标记 1..=n 内——n+1.. 是结点半边的编号，越界会被
 /// 误当作结点 ψ。
-pub fn int_against(
-    cl: &TautClass,
-    kappa: &[(u32, u32)],
-    psi: &[(u32, u32)],
-) -> Result<sc_num::Q, String> {
+pub fn int_against(cl: &TautClass, kappa: &[(u32, u32)], psi: &[(u32, u32)]) -> Result<Q, String> {
     if let Some(t) = cl.terms.first() {
         crate::kppoly::check_marking_legs(psi, t.graph.num_markings())?;
     }
-    // X 的 κ 因子按指标合并：κ_j^p 的 p 个因子拆到各顶点的方式按重数计
-    // （多项式系数），不逐因子独立分配（nv^{因子数} 项）
-    let mut kgroups: Vec<(u32, u32)> = Vec::new();
-    for &(j, p) in kappa {
-        match kgroups.iter_mut().find(|e| e.0 == j) {
-            Some(e) => e.1 += p,
-            None if p > 0 => kgroups.push((j, p)),
-            None => {}
-        }
-    }
+    let mut pairing = Pairing::new(kappa, psi);
     let mut total = Q::ZERO;
     for t in &cl.terms {
-        let verts = t.graph.vertices();
+        total += pairing.evaluate(&t.graph, &t.poly)?;
+    }
+    Ok(total)
+}
+
+/// Reuses external kappa distributions and graph automorphisms while streaming terms.
+pub(crate) struct Pairing<'a> {
+    groups: Vec<(u32, u32)>,
+    psi: &'a [(u32, u32)],
+    distributions: std::collections::BTreeMap<usize, Vec<(Vec<Vec<u32>>, Q)>>,
+    last_graph: Option<(StableGraph, Q)>,
+}
+
+impl<'a> Pairing<'a> {
+    pub(crate) fn new(kappa: &[(u32, u32)], psi: &'a [(u32, u32)]) -> Self {
+        let mut kgroups: Vec<(u32, u32)> = Vec::new();
+        for &(j, p) in kappa {
+            match kgroups.iter_mut().find(|e| e.0 == j) {
+                Some(e) => e.1 += p,
+                None if p > 0 => kgroups.push((j, p)),
+                None => {}
+            }
+        }
+        Self {
+            groups: kgroups,
+            psi,
+            distributions: Default::default(),
+            last_graph: None,
+        }
+    }
+
+    pub(crate) fn evaluate(&mut self, graph: &StableGraph, poly: &KP) -> Result<Q, String> {
+        let verts = graph.vertices();
         let nv = verts.len();
-        let aut_inv = Q::from_signeds(1, t.graph.automorphism_number() as i64);
-        let dists = kappa_distributions(&kgroups, nv);
-        for term in &t.poly.terms {
+        if self
+            .last_graph
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != graph)
+        {
+            self.last_graph = Some((graph.clone(), Q::ONE / graph.automorphism_number()));
+        }
+        let aut_inv = &self.last_graph.as_ref().unwrap().1;
+        let dists = self
+            .distributions
+            .entry(nv)
+            .or_insert_with(|| kappa_distributions(&self.groups, nv));
+        let mut total = Q::ZERO;
+        for term in &poly.terms {
             // 与 TautClass::evaluate 同一求值：同腿 ψ 合并，逐顶点 socle，
             // 顶点度数不符记 0，整体除以 |Aut|
             let mut xpsi = term.psi.clone();
-            xpsi.extend_from_slice(psi);
+            xpsi.extend_from_slice(self.psi);
             let xpsi = crate::kppoly::merge_psi(&xpsi);
             let power_at = |l: u32| xpsi.iter().find(|e| e.0 == l).map_or(0, |e| e.1);
             let psilists: Vec<Vec<u32>> = verts
                 .iter()
                 .map(|v| v.legs.iter().map(|&l| power_at(l)).collect())
                 .collect();
-            for (add, weight) in &dists {
-                let mut v = &term.coeff * &aut_inv * weight;
+            for (add, weight) in dists.iter() {
+                let mut v = &term.coeff * aut_inv * weight;
                 for (vi, vtx) in verts.iter().enumerate() {
                     let mut kl: Vec<u32> = term.kappa.get(vi).cloned().unwrap_or_default();
                     kl.extend_from_slice(&add[vi]);
@@ -151,8 +183,8 @@ pub fn int_against(
                 total += v;
             }
         }
+        Ok(total)
     }
-    Ok(total)
 }
 
 /// X 的 κ 因子（按指标合并的 (j, p)）分到 nv 个顶点的全部方式：每个指标的
@@ -189,6 +221,9 @@ mod tests {
         // 展开系数非空且余维 1
         assert!(!d.is_zero());
         assert_eq!(d.codim(), Some(1));
+        let large = hain_divisor(1, &[4_000_000_000, -4_000_000_000]).unwrap();
+        let factor = Q::from(4_000_000_000i64) * Q::from(4_000_000_000i64);
+        assert_eq!(large, d.scale(&factor));
     }
 }
 
@@ -223,24 +258,18 @@ mod differential {
 
 // ===================== Chiodo DR（固定 r）与 Θ 类 =====================
 
-use crate::generators::tautgens;
+use crate::flow::{FlowTopology, ZeroInterpolator};
+use crate::generators::visit_tautgens;
 use crate::socle::bernoulli;
 
 /// B_n(x)（Bernoulli 多项式求值）。
 fn bern_poly(n: u32, x: &Q) -> Q {
     // B_n(x) = Σ_{k=0}^{n} C(n,k) B_k x^{n−k}
     let mut acc = Q::ZERO;
+    let mut binom = Q::ONE;
     for k in 0..=n {
-        let mut binom = 1i64;
-        for i in 0..k {
-            // C(n,k) 逐步（n 小）
-            binom = binom * (n - i) as i64 / (i + 1) as i64;
-        }
-        let mut term = bernoulli(k as u64) * Q::from(binom);
-        for _ in k..n {
-            term *= x;
-        }
-        acc += term;
+        acc = acc * x + bernoulli(k as u64) * &binom;
+        binom = binom * Q::from(n - k) / Q::from(k + 1);
     }
     acc
 }
@@ -281,75 +310,49 @@ fn edge_coeff(e1: u32, e2: u32) -> std::rc::Rc<APoly> {
 /// S = Σ_i A_i Σ_{j=0}^{i} X^{i−j}(−Y)^j。
 fn edge_coeff_calc(e1: u32, e2: u32) -> APoly {
     let d = e1 + e2;
-    // S 的单项式表：(xdeg, ydeg, A_i, sign)
-    let mut s_mons: Vec<(u32, u32, u32, i64)> = Vec::new();
+    let mut s_mons = Vec::new();
     for i in 0..=d {
         for j in 0..=i {
-            let sign = if j % 2 == 0 { 1 } else { -1 };
-            s_mons.push((i - j, j, i, sign));
-        }
-    }
-    // acc: HashMap<(xdeg,ydeg), APoly>
-    let mut acc: std::collections::BTreeMap<(u32, u32), APoly> = std::collections::BTreeMap::new();
-    // 幂 (X+Y)^{k−1} S^k，截断到度 d；k = 1..=d+1
-    for k in 1..=(d + 1) {
-        // 先算 S^k（截断单项式度 ≤ d），再乘 (X+Y)^{k−1}
-        // S^k：k 个 S 单项式的组合，X度+Y度 ≤ d
-        let mut sk: Vec<(u32, u32, Vec<u32>, i64)> = vec![(0, 0, vec![0u32; d as usize + 1], 1)];
-        for _ in 0..k {
-            let mut next = Vec::new();
-            for (x, y, mut exp, sg) in sk {
-                for &(mx, my, mi, ms) in &s_mons {
-                    let (nx, ny) = (x + mx, y + my);
-                    if nx + ny > d {
-                        continue;
-                    }
-                    exp[mi as usize] += 1;
-                    next.push((nx, ny, exp.clone(), sg * ms));
-                    exp[mi as usize] -= 1;
-                }
-            }
-            // 合并同键
-            let mut merged: std::collections::BTreeMap<(u32, u32, Vec<u32>), i64> =
-                std::collections::BTreeMap::new();
-            for (x, y, exp, sg) in next {
-                *merged.entry((x, y, exp)).or_insert(0) += sg;
-            }
-            sk = merged
-                .into_iter()
-                .filter(|(_, v)| *v != 0)
-                .map(|((x, y, e), v)| (x, y, e, v))
-                .collect();
-        }
-        // 乘 (X+Y)^{k−1} / k!，带负号
-        let mut fact = Q::ONE;
-        for i in 2..=k {
-            fact *= Q::from(i as i64);
-        }
-        let pref = Q::from(-1) / fact;
-        for (x, y, exp, sg) in sk {
-            for j in 0..k {
-                // (X+Y)^{k−1} 的 X^j Y^{k−1−j} 项系数为 C(k−1, j)
-                let mut binom = 1i64;
-                for t in 0..j {
-                    binom = binom * ((k - 1 - t) as i64) / (t + 1) as i64;
-                }
-                let (nx, ny) = (x + j, y + (k - 1 - j));
-                if nx == e1 && ny == e2 {
-                    // 额外乘 C(k−1,j)（在 pref 已含 −1/k!）
-                    let mut key = vec![0u32; d as usize + 1];
-                    for (i, &c) in exp.iter().enumerate() {
-                        key[i] = c;
-                    }
-                    *acc.entry((nx, ny))
-                        .or_default()
-                        .entry(key)
-                        .or_insert(Q::ZERO) += pref.clone() * Q::from(sg * binom);
-                }
+            if i - j <= e1 && j <= e2 {
+                s_mons.push((i - j, j, i, j % 2 == 0));
             }
         }
     }
-    acc.get(&(e1, e2)).cloned().unwrap_or_default()
+    // S^k is extended once per k; merge during multiplication, before allocating
+    // repeated monomials. Exact coefficients avoid intermediate integer overflow.
+    let mut sk = std::collections::BTreeMap::from([((0, 0, vec![0; d as usize + 1]), Q::ONE)]);
+    let mut acc = APoly::new();
+    for k in 1..=d + 1 {
+        let mut next = std::collections::BTreeMap::new();
+        for ((x, y, mut exp), coefficient) in sk {
+            for &(mx, my, mi, positive) in &s_mons {
+                let (nx, ny) = (x + mx, y + my);
+                if nx > e1 || ny > e2 || nx + ny > d + 1 - k {
+                    continue;
+                }
+                exp[mi as usize] += 1;
+                let entry = next.entry((nx, ny, exp.clone())).or_insert(Q::ZERO);
+                if positive {
+                    *entry += &coefficient;
+                } else {
+                    *entry -= &coefficient;
+                }
+                exp[mi as usize] -= 1;
+            }
+        }
+        next.retain(|_, c| !is_zero(c));
+        sk = next;
+        let prefactor = -Q::ONE / sc_num::factorial(k);
+        for ((x, y, exp), coefficient) in &sk {
+            let j = e1 - x;
+            if j < k && y + (k - 1 - j) == e2 {
+                *acc.entry(exp.clone()).or_insert(Q::ZERO) +=
+                    &prefactor * coefficient * sc_num::binomial(k - 1, j);
+            }
+        }
+    }
+    acc.retain(|_, c| !is_zero(c));
+    acc
 }
 
 /// 边因子表 [econtrib(e1, e2, w, m)]_{w=0..m−1}，spin 时偶 w 记 0
@@ -426,7 +429,7 @@ pub fn dr_coeff_one(
             }
         }
     }
-    acc.map(|c| c / Q::from(generator.graph.automorphism_number() as i64))
+    acc.map(|c| c / generator.graph.automorphism_number())
 }
 
 pub fn dr_chiodo(g: u32, a: &[i64], d: u32, k: i64, r: i64) -> Result<TautClass, String> {
@@ -442,43 +445,89 @@ pub fn dr_chiodo(g: u32, a: &[i64], d: u32, k: i64, r: i64) -> Result<TautClass,
         ));
     }
     let mut terms: Vec<DecStratum> = Vec::new();
-    for generator in tautgens(g, n, d) {
-        let (coeff, _) = chiodo_coeff_at(&generator, g, a, d, k, r, false)?;
+    let mut prepared: Option<(StableGraph, ChiodoGeometry)> = None;
+    visit_tautgens(g, n, d, None, &mut |graph, poly| {
+        if prepared
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != graph)
+        {
+            prepared = Some((graph.clone(), ChiodoGeometry::new(graph, a, k)));
+        }
+        let (coeff, _) = chiodo_coeff_at(
+            graph,
+            &poly.terms[0],
+            a,
+            d,
+            k,
+            r,
+            false,
+            &prepared.as_ref().unwrap().1,
+        )?;
         if !is_zero(&coeff) {
             terms.push(DecStratum {
-                graph: generator.graph.clone(),
+                graph: graph.clone(),
                 poly: KP::new(vec![KpTerm {
-                    kappa: generator.poly.terms[0].kappa.clone(),
-                    psi: generator.poly.terms[0].psi.clone(),
+                    kappa: poly.terms[0].kappa.clone(),
+                    psi: poly.terms[0].psi.clone(),
                     coeff,
                 }]),
             });
         }
-    }
+        Ok(())
+    })?;
     Ok(TautClass::new(terms))
 }
 
 /// 单生成元的 Chiodo 系数在固定 m 处的值 = scalar(0,m)·total·m^{2d−h0}。
 /// spin=true 时仅数奇权重（每条边流 w 均为奇；配合偶 m 使用——与
 /// admcycles mpoly_special 的 odd 过滤一致，m 偶时 −w 与 w 同奇偶）。
+struct ChiodoGeometry {
+    given: Vec<i64>,
+    topology: FlowTopology,
+    h0: i64,
+}
+
+impl ChiodoGeometry {
+    fn new(graph: &StableGraph, a: &[i64], k: i64) -> Self {
+        let owner = graph.leg_owner();
+        let nv = graph.vertices().len();
+        let mut given: Vec<_> = graph
+            .vertices()
+            .iter()
+            .map(|v| -k * (2 * v.genus as i64 - 2 + v.legs.len() as i64))
+            .collect();
+        for (i, &av) in a.iter().enumerate() {
+            given[owner[i + 1]] += av;
+        }
+        let sum = given.iter().sum::<i64>();
+        given[0] -= sum;
+        let edges: Vec<_> = graph
+            .edges()
+            .iter()
+            .map(|&(a, b)| (owner[a as usize], owner[b as usize]))
+            .collect();
+        Self {
+            given,
+            topology: FlowTopology::new(&edges, nv),
+            h0: edges.len() as i64 - nv as i64 + 1,
+        }
+    }
+}
+
 fn chiodo_coeff_at(
-    gs: &DecStratum,
-    _g: u32,
+    graph: &StableGraph,
+    t: &KpTerm,
     a: &[i64],
     d: u32,
     k: i64,
     m: i64,
     spin: bool,
+    geometry: &ChiodoGeometry,
 ) -> Result<(Q, i64), String> {
     let n = a.len() as u32;
-    let graph = &gs.graph;
-    let nv = graph.vertices().len();
-    let t = &gs.poly.terms[0];
     let mut scalar = Q::ONE;
-    let mut given = vec![0i64; nv];
     // κ：B 项（逐顶点逐 κ 指标）
-    for (vi, v) in graph.vertices().iter().enumerate() {
-        given[vi] = -k * (2 * v.genus as i64 - 2 + v.legs.len() as i64);
+    for vi in 0..graph.vertices().len() {
         let kap = &t.kappa[vi];
         // 统计各指标出现次数
         let mut counts: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
@@ -500,17 +549,6 @@ fn chiodo_coeff_at(
             }
             scalar = scalar * p / exf;
         }
-    }
-    // 标记：A 权重无条件计入 given（所有标记，与装饰无关——差分定位的
-    // 真根因：此前误绑在 ψ 装饰循环里，未装饰标记的 A 贡献被丢弃）
-    for (li, &av) in a.iter().enumerate() {
-        let l = li as u32 + 1;
-        let vi = graph
-            .vertices()
-            .iter()
-            .position(|v| v.legs.contains(&l))
-            .ok_or(format!("标记 {l} 不在图中"))?;
-        given[vi] += av;
     }
     // 标记 ψ 装饰：分划和因子（仅对有装饰的标记）
     for &(l, pw) in &t.psi {
@@ -558,23 +596,14 @@ fn chiodo_coeff_at(
         }
     }
     // 结点 exp 与权重和
-    let mut edges_v: Vec<(usize, usize)> = Vec::new();
     let mut exps_fine: Vec<(u32, u32)> = Vec::new();
-    let leg_vertex = |l: u32| -> usize {
-        graph
-            .vertices()
-            .iter()
-            .position(|v| v.legs.contains(&l))
-            .unwrap()
-    };
     for &(ea, eb) in graph.edges() {
-        edges_v.push((leg_vertex(ea), leg_vertex(eb)));
         exps_fine.push((t.psi_power_at(ea), t.psi_power_at(eb)));
     }
-
-    let s: i64 = given.iter().sum();
-    given[0] -= s;
-    let h0 = (graph.edges().len() as i64) - (nv as i64) + 1;
+    let h0 = geometry.h0;
+    if is_zero(&scalar) {
+        return Ok((Q::ZERO, h0));
+    }
     // 边因子按 w ∈ 0..m 制表。我们的 w 满足 Bw = −given，参考的 v 满足
     // Bv = given，故 w = −v；参考代入 −v，我们应代入 w（codex 仲裁
     // 2026-10-05）。spin 时只数奇权重：偶 w 记 0。
@@ -583,7 +612,7 @@ fn chiodo_coeff_at(
         .map(|&(e1, e2)| econtrib_table(e1, e2, m, spin))
         .collect();
     let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
-    let total = crate::flow::balanced_flow_sum(&edges_v, &given, m, &table);
+    let total = geometry.topology.sum(&geometry.given, m, &table);
     let mut mpow = Q::ONE;
     let e = 2 * d as i64 - h0;
     if e >= 0 {
@@ -603,6 +632,46 @@ fn chiodo_coeff_at(
 /// 拉格朗日插值 P(r) 后取 P(0)。spin=true（CSS21 spin DR cycle）：m 取偶数、
 /// 仅奇权重、因子 1/2^{g−h0}，要求 A 全奇且 k 奇。
 pub fn dr_chiodo_poly(g: u32, a: &[i64], d: u32, k: i64, spin: bool) -> Result<TautClass, String> {
+    let mut terms = Vec::new();
+    visit_chiodo_poly(g, a, d, k, spin, None, &mut |graph, poly| {
+        terms.push(DecStratum {
+            graph: graph.clone(),
+            poly,
+        });
+        Ok(())
+    })?;
+    Ok(TautClass::new(terms))
+}
+
+/// 插值 DR 类与 κ-ψ 的积分；逐顶点剪枝并逐项求值。
+pub fn int_dr_chiodo_poly(
+    g: u32,
+    a: &[i64],
+    d: u32,
+    k: i64,
+    spin: bool,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+) -> Result<Q, String> {
+    crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
+    let mut pairing = Pairing::new(kappa, psi);
+    let mut total = Q::ZERO;
+    visit_chiodo_poly(g, a, d, k, spin, Some(psi), &mut |graph, poly| {
+        total += pairing.evaluate(graph, &poly)?;
+        Ok(())
+    })?;
+    Ok(total)
+}
+
+fn visit_chiodo_poly(
+    g: u32,
+    a: &[i64],
+    d: u32,
+    k: i64,
+    spin: bool,
+    external_psi: Option<&[(u32, u32)]>,
+    emit: &mut impl FnMut(&StableGraph, KP) -> Result<(), String>,
+) -> Result<(), String> {
     let n = a.len() as u32;
     let asum: i64 = a.iter().sum();
     let chi = 2 * g as i64 - 2 + n as i64;
@@ -625,10 +694,18 @@ pub fn dr_chiodo_poly(g: u32, a: &[i64], d: u32, k: i64, spin: bool) -> Result<T
     let m0 = (abs_sum + 1) / 2 + g as i64 * k.abs();
     let start = m0 + 1;
     let npts = 2 * d as usize + 2;
-    let mut terms: Vec<DecStratum> = Vec::new();
-    for generator in tautgens(g, n, d) {
+    let step = if spin { 2 } else { 1 };
+    let interpolator = ZeroInterpolator::new(step * start, step, npts);
+    let mut prepared: Option<(StableGraph, ChiodoGeometry)> = None;
+    visit_tautgens(g, n, d, external_psi, &mut |graph, poly| {
+        if prepared
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != graph)
+        {
+            prepared = Some((graph.clone(), ChiodoGeometry::new(graph, a, k)));
+        }
+        let geometry = &prepared.as_ref().unwrap().1;
         // 逐点求值
-        let mut pts: Vec<i64> = Vec::with_capacity(npts);
         let mut vals: Vec<Q> = Vec::with_capacity(npts);
         for i in 0..npts {
             let m = if spin {
@@ -636,7 +713,7 @@ pub fn dr_chiodo_poly(g: u32, a: &[i64], d: u32, k: i64, spin: bool) -> Result<T
             } else {
                 start + i as i64
             };
-            let (c, h0) = chiodo_coeff_at(&generator, g, a, d, k, m, spin)?;
+            let (c, h0) = chiodo_coeff_at(graph, &poly.terms[0], a, d, k, m, spin, geometry)?;
             // spin 因子 1/2^{g−h0}
             let mut c = c;
             if spin {
@@ -644,32 +721,22 @@ pub fn dr_chiodo_poly(g: u32, a: &[i64], d: u32, k: i64, spin: bool) -> Result<T
                     c /= Q::from(2);
                 }
             }
-            pts.push(m);
             vals.push(c);
         }
         // 拉格朗日 P(0) = Σ_i v_i Π_{j≠i} (−m_j)/(m_i−m_j)
-        let mut p0 = Q::ZERO;
-        for i in 0..npts {
-            let mut wt = Q::ONE;
-            for j in 0..npts {
-                if i != j {
-                    wt = wt * Q::from(-pts[j]) / Q::from(pts[i] - pts[j]);
-                }
-            }
-            p0 += vals[i].clone() * wt;
-        }
+        let p0 = interpolator.evaluate(&vals);
         if !is_zero(&p0) {
-            terms.push(DecStratum {
-                graph: generator.graph.clone(),
-                poly: KP::new(vec![KpTerm {
-                    kappa: generator.poly.terms[0].kappa.clone(),
-                    psi: generator.poly.terms[0].psi.clone(),
+            emit(
+                graph,
+                KP::new(vec![KpTerm {
+                    kappa: poly.terms[0].kappa.clone(),
+                    psi: poly.terms[0].psi.clone(),
                     coeff: p0,
                 }]),
-            });
+            )?;
         }
-    }
-    Ok(TautClass::new(terms))
+        Ok(())
+    })
 }
 
 /// Norbury Θ_{g,n} = 2^{g−1+n} · 2^{2g−2d−1} · (−1)^d · DR_chiodo(g, (1,..,1), d=2g−2+n, k=−1, r=2)。
@@ -1025,7 +1092,12 @@ mod hyperell_tests {
         // Chiodo 插值主路径（= DR_cycle(chiodo_coeff=True)）
         let dp = |a: &[i64], k: i64, kap: &[(u32, u32)], psi: &[(u32, u32)]| {
             let cls = dr_chiodo_poly(1, a, 1, k, false).unwrap();
-            int_against(&cls, kap, psi).unwrap().to_string()
+            let expected = int_against(&cls, kap, psi).unwrap();
+            assert_eq!(
+                int_dr_chiodo_poly(1, a, 1, k, false, kap, psi).unwrap(),
+                expected
+            );
+            expected.to_string()
         };
         assert_eq!(dp(&[2, 3, -5], 0, &[], &[(1, 1), (2, 1)]), "3/2");
         assert_eq!(dp(&[2, 3, -5], 0, &[(2, 1)], &[]), "37/24");
@@ -1034,7 +1106,12 @@ mod hyperell_tests {
         // spin DR g=1（X deg 1）
         let ds = |a: &[i64], kap: &[(u32, u32)], psi: &[(u32, u32)]| {
             let cls = dr_chiodo_poly(1, a, 1, 1, true).unwrap();
-            int_against(&cls, kap, psi).unwrap().to_string()
+            let expected = int_against(&cls, kap, psi).unwrap();
+            assert_eq!(
+                int_dr_chiodo_poly(1, a, 1, 1, true, kap, psi).unwrap(),
+                expected
+            );
+            expected.to_string()
         };
         assert_eq!(ds(&[1, 1], &[(1, 1)], &[]), "1/24");
         assert_eq!(ds(&[1, 1], &[], &[(1, 1)]), "1/24");

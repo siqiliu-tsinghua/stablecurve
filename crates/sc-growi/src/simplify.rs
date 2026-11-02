@@ -252,7 +252,7 @@ pub fn simplify(ctx: &mut Ctx, iv: &mut Inv) -> Option<Q> {
             if iv.pts[i].psi != 0 || iv.pts[i].h > 1 {
                 break;
             }
-            if iv.pts[i].h == 0 {
+            if iv.pts[i].h <= 0 {
                 continue;
             }
             let d = iv.cdeg as i64;

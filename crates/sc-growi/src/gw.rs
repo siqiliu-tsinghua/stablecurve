@@ -158,6 +158,16 @@ pub fn gw(ctx: &mut Ctx, s: &GwSettings, classes: &[GwClass]) -> Result<Q, GwErr
         if c.count == 0 {
             continue;
         }
+        if s.dim % 2 == 1
+            && c.poly
+                .terms()
+                .iter()
+                .any(|(_, mono)| mono.pairs().iter().any(|&(v, _)| matches!(v, Var::Prim(_))))
+        {
+            return Err(GwError::Invalid(
+                "奇维超曲面的原始类需要反交换配对，目前尚不支持".into(),
+            ));
+        }
         // 原版逐点先查零类：任一插入类为零 ⇒ 不变量为 0（多线性），
         // 不能把该点删掉（那会变成另一个不变量）
         if c.poly.is_zero() {

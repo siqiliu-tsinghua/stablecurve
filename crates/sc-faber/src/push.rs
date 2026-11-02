@@ -2,7 +2,7 @@
 //!
 //! `pushn(g,n,p)` 把 (g,n) 基本类上的 κ-ψ 多项式 p（单顶点、腿=标记
 //! 1..n）沿遗忘第 n 个标记的 π: M̄_{g,n}→M̄_{g,n−1} 前推，满足
-//! ∫_{g,n} p = ∫_{g,n−1} pushn(p)（**g=0 严格成立**，M2 验收即此）。
+//! ∫_{g,n} p = ∫_{g,n−1} pushn(p)。目标模空间须稳定。
 //!
 //! 步骤（KaLa5 `pushn`）：
 //! 1. 替换 κ_j → κ_j + ψ_n^j（拉回关系 κ_j = π^*κ'_j + ψ_n^j）；
@@ -10,10 +10,8 @@
 //! 3. q1：ψ_n^k → κ_{k−1}（k≥2），ψ_n¹ → 标量 2g−3+n（dilaton）；
 //! 4. q0：string 方程——对每个整除 ψ_j（j<n）的单项式加 a/ψ_j。
 //!
-//! ⚠️ 第 4 步的 string 方程仅在 g=0 无修正成立；g≥1 有亏格分裂修正项。
-//! Faber 原版无条件应用（其 ch 递归在 g≥2 使用 push）——数值上其验证例
-//! 全对，但逐步语义待 M4 搭好 admcycles 后对拍定论。本实现如实移植，
-//! 调用方负责 g=0 场景的正确性边界。
+//! string 与 dilaton 在所有亏格成立。前推降低余维 1；无 ψ_n 的常数项
+//! 前推为零，不保留 Faber 积分辅助过程中的原次数项。
 
 use crate::kppoly::{KappaPsiPolynomial, KpTerm};
 use sc_num::Q;
@@ -130,11 +128,8 @@ pub fn pushn(g: u32, n: u32, p: &KappaPsiPolynomial) -> Result<KappaPsiPolynomia
             result.push(t);
         }
     }
-    // 4. q0 的 string 方程（g=0 语义；见模块注释）。
-    //    与 Faber 一致：q0 单项本身保留在结果中（下游过权自然积分为 0），
-    //    另加每个可整除 ψ_j 的 string 项。
+    // 4. q0 的 string 方程。
     for t in q0 {
-        result.push(t.clone());
         for j in 1..n {
             let pj = t.psi_power_at(j);
             if pj == 0 {
@@ -203,15 +198,13 @@ mod tests {
 
     #[test]
     fn pushn_string_g0() {
-        // g=0：pushn(0,4, ψ_1) = 1 + ψ_1（string 项 1；q0 的 ψ_1 按 Faber
-        // 语义保留，其下方 (0,3) 过权积分为 0，不影响 ∫ 恒等式）
+        // 前推降低余维；不应保留原次数项。
         let q = pushn(0, 4, &psw(1, 1)).unwrap();
-        assert_eq!(q, &KP::one() + &psw(1, 1));
-        // pushn(0,5, ψ_1ψ_2) = ψ_1ψ_2 + ψ_1 + ψ_2（q0 保留项 + 两个 string 项；
-        // 保留项在 (0,4) 过权、积分贡献 0——与 Faber 的 q 完全一致）
+        assert_eq!(q, KP::one());
+        assert_eq!(pushn(0, 4, &KP::one()).unwrap(), KP::zero());
+        assert_eq!(pushn(0, 5, &psw(1, 1)).unwrap(), KP::one());
         let q = pushn(0, 5, &(&psw(1, 1) * &psw(2, 1))).unwrap();
-        let expect = &(&psw(1, 1) * &psw(2, 1)) + &psw(1, 1);
-        let expect = &expect + &psw(2, 1);
+        let expect = &psw(1, 1) + &psw(2, 1);
         assert_eq!(q, expect);
     }
 

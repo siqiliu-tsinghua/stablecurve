@@ -141,18 +141,18 @@ pub fn fast_gwloop(g: u32, d: u32, tau_point: &[u32], ta: &[LoopIns], tb: &[Loop
         }
     };
     let mut answer = Q::ZERO;
-    'part: for (w, part) in partition_weights(g, d) {
-        let mut prod = w;
+    'part: for (w, part) in partition_weights(g, d).iter() {
+        let mut prod = w.clone();
         for &k in tau_point {
-            prod *= tau_factor(&part, k);
+            prod *= tau_factor(part, k);
         }
         for &(s, e) in &blocks {
             let dv = if e - s == 1 {
-                entry(&part, rows[s], cols[s])
+                entry(part, rows[s], cols[s])
             } else {
                 det(rows[s..e]
                     .iter()
-                    .map(|&i| cols[s..e].iter().map(|&j| entry(&part, i, j)).collect())
+                    .map(|&i| cols[s..e].iter().map(|&j| entry(part, i, j)).collect())
                     .collect())
             };
             if dv == Q::ZERO {

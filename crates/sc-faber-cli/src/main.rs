@@ -71,7 +71,7 @@ fn twist(q: &Query, a: &[i64]) -> Result<i64, String> {
 }
 
 fn run(q: &Query) -> Result<String, String> {
-    use sc_faber::classes::{dr_chiodo_poly, int_against};
+    use sc_faber::classes::{int_against, int_dr_chiodo_poly};
     match q.op.as_str() {
         "klp" => {
             let n = q.n.ok_or("klp 需要 n")?;
@@ -85,8 +85,8 @@ fn run(q: &Query) -> Result<String, String> {
             let a = q.a.as_ref().ok_or_else(|| format!("{} 需要 a", q.op))?;
             check_marking_legs(&q.psi, a.len() as u32)?;
             let k = twist(q, a)?;
-            let cls = dr_chiodo_poly(q.g, a, q.g, k, q.op == "drspin")?;
-            int_against(&cls, &q.kappa, &q.psi).map(|v| v.to_string())
+            int_dr_chiodo_poly(q.g, a, q.g, k, q.op == "drspin", &q.kappa, &q.psi)
+                .map(|v| v.to_string())
         }
         "grr" => {
             let n = q.n.ok_or("grr 需要 n")?;
@@ -121,8 +121,7 @@ fn run(q: &Query) -> Result<String, String> {
                 };
                 a.push((cn, cd, d));
             }
-            let cls = sc_faber::witten::witten_class(q.g, &a)?;
-            int_against(&cls, &q.kappa, &q.psi).map(|v| v.to_string())
+            sc_faber::witten::int_witten(q.g, &a, &q.kappa, &q.psi).map(|v| v.to_string())
         }
         "hyperell" => {
             let n = q.n.ok_or("hyperell 需要 n")?;

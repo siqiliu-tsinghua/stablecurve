@@ -73,6 +73,33 @@ pub fn graphs_upto(g: u32, n: u32, codim: u32) -> Vec<StableGraph> {
 }
 
 /// 对图 Γ 做一步"余维 +1"扩张：在某顶点加自环（genus−1），或分裂某顶点。
+/// 按二进制顺序枚举子集，不受机器整数位宽限制。fixed_first 固定首元素在左侧。
+pub(crate) fn subsets(n: usize, fixed_first: bool) -> impl Iterator<Item = Vec<bool>> {
+    let mut bits = vec![false; n];
+    if n > 0 && fixed_first {
+        bits[0] = true;
+    }
+    let start = usize::from(fixed_first && n > 0);
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let result = bits.clone();
+        let mut i = start;
+        while i < n && bits[i] {
+            bits[i] = false;
+            i += 1;
+        }
+        if i == n {
+            done = true;
+        } else {
+            bits[i] = true;
+        }
+        Some(result)
+    })
+}
+
 fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
     let mut out = Vec::new();
     let vs = gr.vertices();
@@ -109,22 +136,19 @@ fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
         // 规范形 seen 去重。
         let legs_v = v.legs.clone();
         let m = legs_v.len();
-        for mask in 0u32..(1u32 << m) {
-            if m > 0 && mask & 1 == 0 {
-                continue;
-            }
-            let k1 = mask.count_ones();
+        for mask in subsets(m, true) {
+            let k1 = mask.iter().filter(|&&b| b).count() as u32;
             let k2 = m as u32 - k1;
             let l1: Vec<Leg> = legs_v
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| mask & (1 << i) != 0)
+                .filter(|(i, _)| mask[*i])
                 .map(|(_, &l)| l)
                 .collect();
             let l2: Vec<Leg> = legs_v
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| mask & (1 << i) == 0)
+                .filter(|(i, _)| !mask[*i])
                 .map(|(_, &l)| l)
                 .collect();
             for g1 in 0..=v.genus {
@@ -158,72 +182,114 @@ fn one_step_expansions(gr: &StableGraph) -> Vec<StableGraph> {
 /// R^d(M̄_{g,n}) 的生成元列表（图 + 权重 d−codim(图) 的 κ-ψ 单项式）。
 pub fn tautgens(g: u32, n: u32, d: u32) -> Vec<DecStratum> {
     let mut out = Vec::new();
+    visit_tautgens(g, n, d, None, &mut |gr, mono| {
+        out.push(DecStratum {
+            graph: gr.clone(),
+            poly: mono,
+        });
+        Ok(())
+    })
+    .expect("收集生成元不会失败");
+    out
+}
+
+/// 逐项消费；积分时可传入外部 ψ，按顶点维数提前排除必为零的装饰。
+/// None 保留完整 strata algebra 生成元，包括维数以上的形式项。
+pub(crate) fn visit_tautgens(
+    g: u32,
+    n: u32,
+    d: u32,
+    external_psi: Option<&[(Leg, u32)]>,
+    emit: &mut impl FnMut(&StableGraph, KappaPsiPolynomial) -> Result<(), String>,
+) -> Result<(), String> {
     for c in 0..=d {
         for gr in layer(g, n, c).iter() {
-            for mono in monomials(gr, d - c) {
-                out.push(DecStratum {
-                    graph: gr.clone(),
-                    poly: mono,
-                });
-            }
+            visit_monomials(gr, d - c, false, external_psi, &mut |mono| emit(gr, mono))?;
         }
     }
-    out
+    Ok(())
 }
 
-/// 图 gr 上总权重 w、不带 κ 的全部 ψ 单项式——即 [`monomials`] 中 κ 为空的
-/// 那一部分，顺序一致（DR 的 Pixton 公式里含 κ 的生成元系数为 0）。
-pub(crate) fn psi_monomials(gr: &StableGraph, w: u32) -> Vec<KappaPsiPolynomial> {
-    let nv = gr.vertices().len();
-    let mut all_legs: Vec<Leg> = gr
-        .vertices()
-        .iter()
-        .flat_map(|v| v.legs.iter().copied())
-        .collect();
-    all_legs.sort_unstable();
-    let mut out = Vec::new();
-    enum_psi(&all_legs, 0, w, &mut vec![], &mut |psi| {
-        let poly = KappaPsiPolynomial::new(vec![KpTerm {
-            kappa: vec![vec![]; nv],
-            psi: psi.to_vec(),
-            coeff: Q::ONE,
-        }]);
-        if poly.weight() == Some(w) {
-            out.push(poly);
-        }
-    });
-    out
-}
-
-/// 图 gr 上总权重 w 的全部 κ-ψ 单项式（规范形单项）。
-fn monomials(gr: &StableGraph, w: u32) -> Vec<KappaPsiPolynomial> {
+/// 逐项枚举权重 w 的装饰；psi_only 禁用 κ，external_psi 启用顶点维数剪枝。
+pub(crate) fn visit_monomials(
+    gr: &StableGraph,
+    w: u32,
+    psi_only: bool,
+    external_psi: Option<&[(Leg, u32)]>,
+    emit: &mut impl FnMut(KappaPsiPolynomial) -> Result<(), String>,
+) -> Result<(), String> {
     // 逐顶点 κ 指标候选 + 腿候选，做权重恰好 w 的组合枚举
     let vs = gr.vertices();
     let nv = vs.len();
-    let kappa_bounds: Vec<u32> = vs
+    let mut kappa_bounds: Vec<u32> = vs
         .iter()
         .map(|v| (3 * v.genus as i64 - 3 + v.legs.len() as i64).max(0) as u32)
         .collect();
-    let mut all_legs: Vec<Leg> = vs.iter().flat_map(|v| v.legs.iter().copied()).collect();
+    let mut limits = vec![w; nv];
+    if let Some(psi) = external_psi {
+        for (i, v) in vs.iter().enumerate() {
+            let extra: u64 = psi
+                .iter()
+                .filter(|(l, _)| v.legs.contains(l))
+                .map(|&(_, p)| u64::from(p))
+                .sum();
+            if extra > u64::from(kappa_bounds[i]) {
+                return Ok(());
+            }
+            limits[i] = kappa_bounds[i] - extra as u32;
+            kappa_bounds[i] = limits[i];
+        }
+        if limits.iter().map(|&x| u64::from(x)).sum::<u64>() < u64::from(w) {
+            return Ok(());
+        }
+    }
+    if psi_only {
+        kappa_bounds.fill(0);
+    }
+    let mut all_legs: Vec<(Leg, usize)> = vs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, v)| v.legs.iter().map(move |&l| (l, i)))
+        .collect();
     all_legs.sort_unstable();
 
-    let mut out = Vec::new();
+    let mut result = Ok(());
     let mut kappa_part: Vec<Vec<u32>> = vec![vec![]; nv];
     let mut legs_part: Vec<(Leg, u32)> = vec![];
-    enum_kappa(&kappa_bounds, 0, w, &mut kappa_part, &mut |kappa, rem| {
-        enum_psi(&all_legs, 0, rem, &mut legs_part, &mut |psi| {
-            let term = KpTerm {
-                kappa: kappa.to_vec(),
-                psi: psi.to_vec(),
-                coeff: Q::ONE,
-            };
-            let poly = KappaPsiPolynomial::new(vec![term]);
-            if poly.weight() == Some(w) {
-                out.push(poly);
+    enum_kappa(
+        &kappa_bounds,
+        0,
+        w,
+        external_psi.is_some(),
+        &mut kappa_part,
+        &mut |kappa, rem| {
+            let mut remaining = limits.clone();
+            if external_psi.is_some() {
+                for (budget, part) in remaining.iter_mut().zip(kappa) {
+                    *budget -= part.iter().sum::<u32>();
+                }
             }
-        });
-    });
-    out
+            enum_psi(
+                &all_legs,
+                0,
+                rem,
+                &mut remaining,
+                &mut legs_part,
+                &mut |psi| {
+                    let term = KpTerm {
+                        kappa: kappa.to_vec(),
+                        psi: psi.to_vec(),
+                        coeff: Q::ONE,
+                    };
+                    let poly = KappaPsiPolynomial::new(vec![term]);
+                    if result.is_ok() {
+                        result = emit(poly);
+                    }
+                },
+            );
+        },
+    );
+    result
 }
 
 /// 枚举逐顶点 κ 分划，总 κ 权重 ≤ budget（剩余给 ψ）。
@@ -231,6 +297,7 @@ fn enum_kappa(
     bounds: &[u32],
     v: usize,
     budget: u32,
+    enforce_bounds: bool,
     acc: &mut Vec<Vec<u32>>,
     k: &mut impl FnMut(&[Vec<u32>], u32),
 ) {
@@ -240,9 +307,21 @@ fn enum_kappa(
     }
     // 顶点 v 的分划：递归地选升序指标序列，权重 ≤ budget
     let mut part: Vec<u32> = vec![];
-    enum_partition(bounds[v], budget, 1, &mut part, &mut |part, rem| {
+    let limit = if enforce_bounds {
+        budget.min(bounds[v])
+    } else {
+        budget
+    };
+    enum_partition(bounds[v], limit, 1, &mut part, &mut |part, rem| {
         acc[v] = part.to_vec();
-        enum_kappa(bounds, v + 1, rem, acc, k);
+        enum_kappa(
+            bounds,
+            v + 1,
+            budget - (limit - rem),
+            enforce_bounds,
+            acc,
+            k,
+        );
     });
     acc[v] = vec![];
 }
@@ -267,9 +346,10 @@ fn enum_partition(
 
 /// 枚举腿上的 ψ 幂分配，总幂恰好 rem。
 fn enum_psi(
-    legs: &[Leg],
+    legs: &[(Leg, usize)],
     i: usize,
     rem: u32,
+    remaining: &mut [u32],
     acc: &mut Vec<(Leg, u32)>,
     k: &mut impl FnMut(&[(Leg, u32)]),
 ) {
@@ -281,10 +361,13 @@ fn enum_psi(
         return;
     }
     // 腿 i 分到 1..rem 幂，或 0（跳过）
-    enum_psi(legs, i + 1, rem, acc, k);
-    for p in 1..=rem {
-        acc.push((legs[i], p));
-        enum_psi(legs, i + 1, rem - p, acc, k);
+    enum_psi(legs, i + 1, rem, remaining, acc, k);
+    let (leg, vertex) = legs[i];
+    for p in 1..=rem.min(remaining[vertex]) {
+        acc.push((leg, p));
+        remaining[vertex] -= p;
+        enum_psi(legs, i + 1, rem - p, remaining, acc, k);
+        remaining[vertex] += p;
         acc.pop();
     }
 }
@@ -292,6 +375,17 @@ fn enum_psi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subsets_are_not_limited_to_a_word() {
+        assert_eq!(subsets(0, true).count(), 1);
+        assert_eq!(subsets(5, true).count(), 16);
+        for n in [32, 65] {
+            let v: Vec<_> = subsets(n, true).take(3).collect();
+            assert_eq!(v.len(), 3);
+            assert!(v[0][0] && v[1][1] && v[2][2]);
+        }
+    }
 
     fn count(g: u32, n: u32, d: u32) -> usize {
         tautgens(g, n, d).len()

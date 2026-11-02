@@ -22,6 +22,7 @@ pub struct Linsys {
     entries: Vec<Q>, // (maxsize+1)*(maxsize+1)；列 maxsize 为 RHS
     rows: usize,
     cols: usize,
+    odd_column_permutation: bool,
     /// 变量名 → 当前列号（加速 add_var 的线性查找；原版为 O(n) 扫描，
     /// 语义一致）
     by_name: HashMap<i32, usize>,
@@ -38,6 +39,7 @@ impl Linsys {
             entries: vec![Q::ZERO; n * n],
             rows: 0,
             cols: 0,
+            odd_column_permutation: false,
             by_name: HashMap::new(),
         }
     }
@@ -85,6 +87,18 @@ impl Linsys {
     /// 当前方程加常数项（右端）。
     pub fn add_const_term(&mut self, c: Q) {
         *self.e_mut(self.rows, self.maxsize) += c;
+    }
+
+    /// 放弃未完成的方程，并移除仅由该方程引入的变量。
+    pub(crate) fn discard_row(&mut self, previous_cols: usize) {
+        for i in 0..self.cols {
+            *self.e_mut(self.rows, i) = Q::ZERO;
+        }
+        *self.e_mut(self.rows, self.maxsize) = Q::ZERO;
+        for i in previous_cols..self.cols {
+            self.by_name.remove(&self.varnames[i]);
+        }
+        self.cols = previous_cols;
     }
 
     /// 提交当前方程并消元。
@@ -135,6 +149,7 @@ impl Linsys {
 
         // 交换变量列 i 与 rows（重命名）
         if i != rows {
+            self.odd_column_permutation = !self.odd_column_permutation;
             self.varnames.swap(i, rows);
             self.by_name.insert(self.varnames[i], i);
             self.by_name.insert(self.varnames[rows], rows);
@@ -217,7 +232,11 @@ impl Linsys {
         if self.cols != self.rows {
             return None;
         }
-        let mut result = Q::ONE;
+        let mut result = if self.odd_column_permutation {
+            -Q::ONE
+        } else {
+            Q::ONE
+        };
         for i in (0..self.rows).rev() {
             result *= self.e(i, i);
         }
@@ -229,6 +248,33 @@ impl Linsys {
 mod tests {
     use super::*;
     use crate::num::q;
+
+    #[test]
+    fn discarded_equation_leaves_no_terms_or_variables() {
+        let mut s = Linsys::new(3);
+        s.add_var(1);
+        s.add_var_term(1, q(5));
+        s.add_var_term(2, q(7));
+        s.add_const_term(q(9));
+        s.discard_row(1);
+        assert!(s.add_var_term(1, q(1)));
+        s.add_const_term(q(3));
+        assert_eq!(s.send_row(), LinsysT::Solvable);
+        assert_eq!(s.value_by_name(1), Some(q(3)));
+        assert_eq!(s.value_by_name(2), None);
+    }
+
+    #[test]
+    fn determinant_keeps_column_permutation_sign() {
+        let mut s = Linsys::new(2);
+        s.add_var(1);
+        s.add_var(2);
+        s.add_var_term(2, q(1));
+        s.send_row();
+        s.add_var_term(1, q(1));
+        s.send_row();
+        assert_eq!(s.det(), Some(q(-1)));
+    }
 
     #[test]
     fn solves_unique_system() {

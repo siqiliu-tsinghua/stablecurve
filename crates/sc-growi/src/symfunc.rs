@@ -1,17 +1,17 @@
-//! Virasoro 条件的对称函数系数——原版 `libgw/symfunc.{h,cc}` 的直译。
+//! Virasoro 条件的对称函数系数；逐次乘线性因子，保存完整系数行。
 //!
 //! `symfunc(x,k,i)` = 数 x,x+1,…,x+k 的第 (k+1−i) 个初等对称函数，即
 //! `∏(s+x+j) = Σ symfunc(x,k,i)·s^i`。递推：
 //! `symfunc(x,k,i) = Σ_j (x+j)·symfunc(x+j+1, k−1−j, i−j)`。
-//! 原版存 symfunc.dbm；这里用进程内缓存（同查询跨 Virasoro 调用复用）。
+//! 原版存 symfunc.dbm；这里直接以有理数为键复用系数表，省去字符串转换。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::num::{One, Q, Zero};
 
 thread_local! {
-    static CACHE: RefCell<HashMap<(String, i32, i32), Q>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<BTreeMap<Q, Vec<Vec<Q>>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 pub fn symfunc(x: &Q, k: i32, i: i32) -> Q {
@@ -23,22 +23,23 @@ pub fn symfunc(x: &Q, k: i32, i: i32) -> Q {
         return Q::ONE;
     }
 
-    let key = (x.to_string(), k, i);
-    let hit = CACHE.with(|c| c.borrow().get(&key).cloned());
-    if let Some(v) = hit {
-        return v;
-    }
-
-    // 递推计算
-    let mut result = Q::ZERO;
-    for j in 0..=i {
-        let xj = x + Q::from(j);
-        let xj1 = xj.clone() + Q::ONE;
-        result += &xj * &symfunc(&xj1, k - 1 - j, i - j);
-    }
-
-    CACHE.with(|c| c.borrow_mut().insert(key, result.clone()));
-    result
+    CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let rows = cache.entry(x.clone()).or_insert_with(|| vec![vec![Q::ONE]]);
+        // 第 r 行是 ∏_{j<r}(s+x+j)；一次延长得到该行所有系数。
+        while rows.len() <= k as usize + 1 {
+            let r = rows.len() - 1;
+            let shift = x + Q::from(r);
+            let previous = &rows[r];
+            let mut next = vec![Q::ZERO; previous.len() + 1];
+            for (j, c) in previous.iter().enumerate() {
+                next[j] += c * &shift;
+                next[j + 1] += c;
+            }
+            rows.push(next);
+        }
+        rows[k as usize + 1][i as usize].clone()
+    })
 }
 
 #[cfg(test)]

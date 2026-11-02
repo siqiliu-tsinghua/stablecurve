@@ -13,22 +13,15 @@
 use crate::comb::partition;
 use crate::qseries::{bernoulli, z_over_2sinh_coeff};
 use sc_num::{One, Q, Zero};
+use std::rc::Rc;
 
 fn fact(n: u32) -> Q {
-    let mut v = Q::ONE;
-    for i in 2..=n {
-        v *= Q::from(i as i64);
-    }
-    v
+    sc_num::factorial(n)
 }
 
 /// q^e（整数指数，e ≥ 0）。
 fn q_pow(base: &Q, e: u32) -> Q {
-    let mut v = Q::ONE;
-    for _ in 0..e {
-        v *= base.clone();
-    }
-    v
+    sc_num::pow_unsigned(base, u64::from(e))
 }
 
 /// 幂和 + Bernoulli 修正（GWall `power`）：
@@ -63,34 +56,60 @@ fn hook_product(part: &[u32]) -> Q {
 
 /// gwpoint 的分拆展开 ⟨Π τ_k(pt)⟩_{g,d} = Σ_{λ ⊢ d} w(λ)·Π_k f_λ(k) 中的
 /// (w(λ), λ)，w(λ) = (Π 钩长)^{2g−2}；f_λ 见 [`tau_factor`]。
-pub(crate) fn partition_weights(g: u32, d: u32) -> Vec<(Q, Vec<u32>)> {
+pub(crate) fn partition_weights(g: u32, d: u32) -> Rc<Vec<(Q, Vec<u32>)>> {
+    thread_local! {
+        static TABLE: std::cell::RefCell<std::collections::BTreeMap<(u32, u32), Rc<Vec<(Q, Vec<u32>)>>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    if let Some(value) = TABLE.with(|cell| cell.borrow().get(&(g, d)).cloned()) {
+        return value;
+    }
     let e = 2 * g as i64 - 2;
-    partition(d)
-        .into_iter()
-        .map(|part| {
-            let base = hook_product(&part);
-            let w = if e >= 0 {
-                q_pow(&base, e as u32)
-            } else {
-                Q::ONE / q_pow(&base, (-e) as u32)
-            };
-            (w, part)
-        })
-        .collect()
+    let result = Rc::new(
+        partition(d)
+            .into_iter()
+            .map(|part| {
+                let base = hook_product(&part);
+                let w = if e >= 0 {
+                    sc_num::pow_unsigned(&base, e as u64)
+                } else {
+                    Q::ONE / q_pow(&base, (-e) as u32)
+                };
+                (w, part)
+            })
+            .collect(),
+    );
+    TABLE.with(|cell| cell.borrow_mut().insert((g, d), Rc::clone(&result)));
+    result
 }
 
 /// 单个点插入 τ_k(pt) 在分拆 λ 处的因子 f_λ(k) = power(λ, k+1)/(k+1)!。
 pub(crate) fn tau_factor(part: &[u32], k: u32) -> Q {
-    power(part, k + 1) / fact(k + 1)
+    thread_local! {
+        static TABLE: std::cell::RefCell<std::collections::BTreeMap<Vec<u32>, Vec<Q>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+    TABLE.with(|cell| {
+        let mut table = cell.borrow_mut();
+        if let Some(value) = table.get(part).and_then(|row| row.get(k as usize)) {
+            return value.clone();
+        }
+        let row = table.entry(part.to_vec()).or_default();
+        while row.len() <= k as usize {
+            let l = row.len() as u32 + 1;
+            row.push(power(part, l) / fact(l));
+        }
+        row[k as usize].clone()
+    })
 }
 
 /// ⟨Π τ_{k_i}(pt)⟩_{g,d}（不连通；g 为 target 曲线亏格）。GWall `GWpoint`。
 pub fn gwpoint(g: u32, d: u32, tau: &[u32]) -> Q {
     let mut answer = Q::ZERO;
-    for (w, part) in partition_weights(g, d) {
-        let mut prod = w;
+    for (w, part) in partition_weights(g, d).iter() {
+        let mut prod = w.clone();
         for &k in tau {
-            prod *= tau_factor(&part, k);
+            prod *= tau_factor(part, k);
         }
         answer += prod;
     }

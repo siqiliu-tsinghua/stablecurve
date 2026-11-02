@@ -1096,7 +1096,8 @@ impl RelInv {
             if self.prims.clone() + Q::from(j as i64) < Q::ZERO {
                 return Q::ZERO; // 用了超过存在的原始类个数
             }
-            for i in self.cpt_prim[0]..j {
+            // 新的原始类编号依次减小；只对尚未指定的类计选择数。
+            for i in (j + 1..=self.cpt_prim[0]).rev() {
                 result *= self.prims.clone() + Q::from(i as i64);
             }
             for i in 1..self.ncpt {

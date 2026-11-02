@@ -17,6 +17,8 @@
 //! 手验锚点（admcycles 文档值 × 自同构调整后）：DR(1,(2,3,−5)) =
 //! 2ψ₁+9/2ψ₂+25/2ψ₃ −(1/12)[Δ₀] −(25/2)[3|12] −…（我们的 [Δ₀] = 物理轨迹类
 
+use crate::flow::{FlowTopology, ZeroInterpolator};
+use crate::graph::StableGraph;
 use crate::kppoly::KappaPsiPolynomial;
 use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
@@ -56,26 +58,10 @@ fn weight_table(s: u32, m: i64) -> Rc<Vec<Q>> {
 }
 
 /// 平衡权重系统的和：Σ Π_e w_e^{2 exp_e}（mod m 平衡，u 出边 +w、v 入边 −w）。
-fn balanced_weight_sum(edges: &[(usize, usize)], exps: &[u32], given: &[i64], m: i64) -> Q {
+fn balanced_weight_sum(topology: &FlowTopology, exps: &[u32], given: &[i64], m: i64) -> Q {
     let tables: Vec<Rc<Vec<Q>>> = exps.iter().map(|&s| weight_table(s, m)).collect();
     let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
-    crate::flow::balanced_flow_sum(edges, given, m, &table)
-}
-
-/// 拉格朗日插值：给定点 (xs, ys)，求 p(0)。
-fn interpolate_at_zero(xs: &[i64], ys: &[Q]) -> Q {
-    let mut acc = Q::ZERO;
-    for (j, (&xj, yj)) in xs.iter().zip(ys).enumerate() {
-        let mut term = yj.clone();
-        for (k, &xk) in xs.iter().enumerate() {
-            if k != j {
-                // (0 − xk)/(xj − xk)
-                term *= Q::from(-xk) / Q::from(xj - xk);
-            }
-        }
-        acc += term;
-    }
-    acc
+    topology.sum(given, m, &table)
 }
 
 /// DR_g(A) 余维 r 的类（A 长度 = n，ΣA = 0；r 默认 g）。
@@ -95,19 +81,32 @@ fn dr_cycle_impl(
     r: Option<u32>,
     gen_norm: bool,
 ) -> Result<TautClass, String> {
+    let mut terms = Vec::new();
+    visit_dr(g, dvector, r, gen_norm, None, &mut |graph, poly| {
+        terms.push(DecStratum {
+            graph: graph.clone(),
+            poly,
+        });
+        Ok(())
+    })?;
+    Ok(TautClass::new(terms))
+}
+
+fn visit_dr(
+    g: u32,
+    dvector: &[i64],
+    r: Option<u32>,
+    gen_norm: bool,
+    external_psi: Option<&[(u32, u32)]>,
+    emit: &mut impl FnMut(&StableGraph, KappaPsiPolynomial) -> Result<(), String>,
+) -> Result<(), String> {
     let n = dvector.len() as u32;
-    let r = r.unwrap_or(g);
-    if dvector.iter().sum::<i64>() != 0 {
-        return Err(format!("DR 要求 ΣA = 0，得到 {dvector:?}"));
-    }
-    if 2 * g as i64 - 2 + n as i64 <= 0 {
-        return Err(format!("M̄_({g},{n}) 不稳定"));
-    }
-    if r as i64 > 3 * g as i64 - 3 + n as i64 {
-        return Err("余维超过模空间维数".into());
-    }
+    let r = dr_degree(g, dvector, r)?;
     let m0 = (dvector.iter().map(|d| d.abs()).sum::<i64>() + 1) / 2;
-    let mut terms: Vec<DecStratum> = Vec::new();
+    let two_pow = sc_num::pow_unsigned(&Q::from(2), u64::from(r));
+    let interpolators: Vec<_> = (0..=r)
+        .map(|s| ZeroInterpolator::new(m0 + 1, 1, 2 * s as usize + 2))
+        .collect();
     // 含 κ 的生成元系数为 0（kval = 0），只枚举纯 ψ 装饰（顺序与 tautgens
     // 中 κ 为空的部分一致）。顶点、给定值、圈秩逐图只算一次；Q_Γ(0) 只依赖
     // 图与各结点的指数，图内按结点指数缓存。
@@ -131,6 +130,7 @@ fn dr_cycle_impl(
                 .iter()
                 .map(|&(a, b)| (owner[a as usize], owner[b as usize]))
                 .collect();
+            let topology = FlowTopology::new(&edges_v, nv);
             // given[v] = Σ_{v 的标记} d
             let mut given = vec![0i64; nv];
             for l in 1..=n {
@@ -141,12 +141,12 @@ fn dr_cycle_impl(
             // 我们的 TautClass 口径为 ξ_*/|Aut|（evaluate 时统一除），故此处
             // 不再放 1/aut，积分结果与 admcycles 直接可比。
             let aut_scalar = if gen_norm {
-                Q::from_signeds(1, graph.automorphism_number() as i64)
+                Q::ONE / graph.automorphism_number()
             } else {
                 Q::ONE
             };
             let mut q0_cache: HashMap<Vec<u32>, Q> = HashMap::new();
-            for poly in crate::generators::psi_monomials(graph, r - c) {
+            crate::generators::visit_monomials(graph, r - c, true, external_psi, &mut |poly| {
                 let t = &poly.terms[0];
                 // 标记部分：d^{2e}/e!
                 let mut scalar = aut_scalar.clone();
@@ -159,6 +159,9 @@ fn dr_cycle_impl(
                         }
                         scalar = scalar * p / fact(e as u64);
                     }
+                }
+                if is_zero(&scalar) {
+                    return Ok(());
                 }
                 // 结点部分：exp = e1+e2+1，因子 −1/(e1!e2!(e1+e2+1))
                 let mut exps: Vec<u32> = Vec::with_capacity(edges_v.len());
@@ -174,37 +177,52 @@ fn dr_cycle_impl(
                 let q0 = q0_cache
                     .entry(exps.clone())
                     .or_insert_with(|| {
-                        let deg: u32 = 2 * exps.iter().sum::<u32>();
-                        let mut xs = Vec::new();
+                        let s = exps.iter().sum::<u32>();
+                        let deg = 2 * s;
                         let mut ys = Vec::new();
                         for m in (m0 + 1)..=(m0 + deg as i64 + 2) {
-                            let mut q = balanced_weight_sum(&edges_v, &exps, &given, m);
+                            let mut q = balanced_weight_sum(&topology, &exps, &given, m);
                             // b1 ≥ 0（连通图）
                             for _ in 0..b1.max(0) {
                                 q /= Q::from(m);
                             }
-                            xs.push(m);
                             ys.push(q);
                         }
-                        interpolate_at_zero(&xs, &ys)
+                        interpolators[s as usize].evaluate(&ys)
                     })
                     .clone();
-                let coeff = scalar * q0 * Q::from_signeds(1, 2i64.pow(r));
+                let coeff = scalar * q0 / &two_pow;
                 if !is_zero(&coeff) {
                     // 展开成单项式列表（装饰中 ψ 只在标记与结点半边上）
-                    terms.push(DecStratum {
-                        graph: graph.clone(),
-                        poly: KappaPsiPolynomial::new(vec![crate::kppoly::KpTerm {
+                    emit(
+                        graph,
+                        KappaPsiPolynomial::new(vec![crate::kppoly::KpTerm {
                             kappa: t.kappa.clone(),
                             psi: t.psi.clone(),
                             coeff,
                         }]),
-                    });
+                    )?;
                 }
-            }
+                Ok(())
+            })?;
         }
     }
-    Ok(TautClass::new(terms))
+    Ok(())
+}
+
+fn dr_degree(g: u32, a: &[i64], r: Option<u32>) -> Result<u32, String> {
+    let n = a.len() as i64;
+    let r = r.unwrap_or(g);
+    if a.iter().map(|&x| i128::from(x)).sum::<i128>() != 0 {
+        return Err(format!("DR 要求 ΣA = 0，得到 {a:?}"));
+    }
+    if 2 * i64::from(g) - 2 + n <= 0 {
+        return Err(format!("M̄_({g},{n}) 不稳定"));
+    }
+    if i64::from(r) > 3 * i64::from(g) - 3 + n {
+        return Err("余维超过模空间维数".into());
+    }
+    Ok(r)
 }
 
 /// ∫_{M̄_{g,n}} DR · X，X 为基本类上的 κ-ψ 单项式。
@@ -218,14 +236,52 @@ pub fn int_dr(
     psi: &[(u32, u32)],
 ) -> Result<Q, String> {
     crate::kppoly::check_marking_legs(psi, dvector.len() as u32)?;
-    let cls = dr_cycle(g, dvector, r)?;
-    // DR 的生成元不带 κ 装饰，int_against 的"保留原项 κ"在此退化为空
-    crate::classes::int_against(&cls, kappa, psi)
+    let degree = dr_degree(g, dvector, r)?;
+    let weight = u128::from(degree)
+        + kappa
+            .iter()
+            .map(|&(i, p)| u128::from(i) * u128::from(p))
+            .sum::<u128>()
+        + psi.iter().map(|&(_, p)| u128::from(p)).sum::<u128>();
+    if degree > g || weight != (3 * i64::from(g) - 3 + dvector.len() as i64) as u128 {
+        return Ok(Q::ZERO);
+    }
+    let mut pairing = crate::classes::Pairing::new(kappa, psi);
+    let mut total = Q::ZERO;
+    visit_dr(g, dvector, r, false, Some(psi), &mut |graph, poly| {
+        total += pairing.evaluate(graph, &poly)?;
+        Ok(())
+    })?;
+    Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_integrals_match_complete_classes() {
+        for g in 1..=3 {
+            let a = [3, -3];
+            let cls = dr_cycle(g, &a, None).unwrap();
+            let chiodo = crate::classes::dr_chiodo_poly(g, &a, g, 0, false).unwrap();
+            for p in 0..=2 {
+                let degree = 2 * g - 1;
+                let kappa = [(1, p)];
+                let psi = [(1, degree.saturating_sub(p))];
+                let expected = crate::classes::int_against(&cls, &kappa, &psi).unwrap();
+                assert_eq!(int_dr(g, &a, None, &kappa, &psi).unwrap(), expected);
+                assert_eq!(
+                    crate::classes::int_against(&chiodo, &kappa, &psi).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    crate::classes::int_dr_chiodo_poly(g, &a, g, 0, false, &kappa, &psi).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
 
     /// admcycles 文档锚点：DR(1,(2,3,−5)) =
     /// 2ψ₁ + 9/2ψ₂ + 25/2ψ₃（基本类） −1/24（Δ₀） −25/2 −9/2 −2（三个分离边界）。

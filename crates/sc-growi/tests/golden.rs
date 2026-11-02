@@ -396,7 +396,7 @@ fn relative_descendants_and_primitives() {
     .unwrap();
     assert_eq!(r.to_string(), "525");
 
-    // 原类平方：pc(1)²= H³/E（引擎自动折 1/5 因子），值为 H³ψ 情形 1575/2 ÷ 5
+    // 奇维原始类需要反交换配对；不能按偶类平方规则返回数值。
     let s = GwSettings {
         dim: 3,
         deg: 5,
@@ -412,9 +412,8 @@ fn relative_descendants_and_primitives() {
             count: 1,
         }],
     )
-    .unwrap();
-    assert_eq!(r.to_string(), "315/2");
-    // pc(1)² 无 ψ：972 = 4860/5
+    .unwrap_err();
+    assert!(matches!(r, sc_growi::GwError::Invalid(_)));
     let r = gw(
         &mut ctx,
         &s,
@@ -424,6 +423,23 @@ fn relative_descendants_and_primitives() {
             count: 1,
         }],
     )
-    .unwrap();
-    assert_eq!(r.to_string(), "972");
+    .unwrap_err();
+    assert!(matches!(r, sc_growi::GwError::Invalid(_)));
+}
+
+#[test]
+fn primitive_divisors_are_not_hyperplane_divisors() {
+    let mut ctx = sc_growi::Ctx::memory();
+    let query = sc_growi::query::parse("lines in cubic surface thru pc(1),pc(1)").unwrap();
+    assert_eq!(
+        gw(&mut ctx, &query.settings, &query.classes)
+            .unwrap()
+            .to_string(),
+        "-6"
+    );
+    let query = sc_growi::query::parse("points in cubic threefold thru pc(1),pc(1),1").unwrap();
+    assert!(matches!(
+        gw(&mut ctx, &query.settings, &query.classes),
+        Err(sc_growi::GwError::Invalid(_))
+    ));
 }

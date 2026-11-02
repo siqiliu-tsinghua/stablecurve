@@ -184,7 +184,7 @@ fn main() {
             }]);
             // oracle 口径：ξ_*dec 不除 aut → 我们的 int_against(已除 aut) 乘回 aut
             let aut = graph.automorphism_number();
-            let i_val = int_against(&cls, &[], &[(1, 1)]).unwrap_or_default() * Q::from(aut as i64);
+            let i_val = int_against(&cls, &[], &[(1, 1)]).unwrap_or_default() * aut;
             let key = struct_key(&graph);
             *totals.entry(key).or_insert(Q::ZERO) += coeff * i_val;
         }
@@ -199,7 +199,7 @@ fn main() {
             // dr_coeff_one 已含 1/aut（oracle 口径）→ 积分乘回 aut 到 ξ_* 口径
             let cls = TautClass::new(vec![generator.clone()]);
             let aut = generator.graph.automorphism_number();
-            let i_val = int_against(&cls, &[], &[(1, 1)]).unwrap_or_default() * Q::from(aut as i64);
+            let i_val = int_against(&cls, &[], &[(1, 1)]).unwrap_or_default() * aut;
             let key = struct_key(&generator.graph);
             *totals.entry(key).or_insert(Q::ZERO) += c * i_val;
         }

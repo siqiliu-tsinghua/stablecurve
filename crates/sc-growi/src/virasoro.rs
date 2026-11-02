@@ -18,9 +18,9 @@ use crate::trr::trr_variable;
 
 const VIRASORO_TRY: i32 = 5;
 
-fn vdbg(msg: &str) {
+fn vdbg(msg: impl FnOnce() -> String) {
     if crate::env_flag("SC_GROWI_VIRASORO") {
-        eprintln!("[vir] {msg}");
+        eprintln!("[vir] {}", msg());
     }
 }
 
@@ -42,9 +42,9 @@ fn virasoro_a(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
         if crate::num::is_zero(&term) {
             continue;
         }
-        vdbg(&format!("A need term {term}*{iw}"));
+        vdbg(|| format!("A need term {term}*{iw}"));
         term = trr_variable(ctx, sys, &iw, &term)?;
-        vdbg(&format!("A got {term}"));
+        vdbg(|| format!("A got {term}"));
         result += term;
     }
     Some(result)
@@ -83,7 +83,7 @@ fn virasoro_b(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
                 if crate::num::is_zero(&term) {
                     continue;
                 }
-                vdbg(&format!("B need term {term}*{iw}"));
+                vdbg(|| format!("B need term {term}*{iw}"));
                 term *= ctx.compute(&iw)?;
                 result += term;
             }
@@ -129,7 +129,7 @@ fn virasoro_c(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
                 if crate::num::is_zero(&term) {
                     continue;
                 }
-                vdbg(&format!("B need term {term}*{iw}"));
+                vdbg(|| format!("B need term {term}*{iw}"));
                 term *= ctx.compute(&iw)?;
                 result += term;
             }
@@ -205,7 +205,7 @@ fn virasoro_d(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
                         if crate::num::is_zero(&fact) {
                             continue;
                         }
-                        vdbg(&format!("D need term {fact}*{coeff}*{av}*{aw}"));
+                        vdbg(|| format!("D need term {fact}*{coeff}*{av}*{aw}"));
 
                         // 原版先算 w 侧
                         let mut tmpw = ctx.compute(&aw)?;
@@ -242,6 +242,7 @@ fn virasoro_d(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
 
 /// 组装一条 L_k 方程并提交。各项算不出 → 不定（原版 UNDETERMINED）。
 fn virasoro_k(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> LinsysT {
+    let previous_cols = sys.numvars();
     let va = virasoro_a(ctx, sys, iv, k, d);
     let vb = virasoro_b(ctx, iv, k, d);
     let vc = virasoro_c(ctx, iv, k, d);
@@ -251,7 +252,10 @@ fn virasoro_k(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Lins
     }
     let x = match (va, vb, vc, vd) {
         (Some(a), Some(b), Some(c), Some(dd)) => a + b + c + dd,
-        _ => return LinsysT::Undetermined,
+        _ => {
+            sys.discard_row(previous_cols);
+            return LinsysT::Undetermined;
+        }
     };
     sys.add_const_term(x);
     if crate::env_flag("SC_GROWI_VIRASORO") {
