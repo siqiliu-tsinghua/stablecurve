@@ -1,6 +1,7 @@
-//! λ 与 ch 类的积分：Faber `klp/klmgn` ch 分支的完整移植。
+//! λ 与 ch 类的积分。纯 λ-ψ 输入走直接后代递归；含 κ/ch 的输入保留
+//! Faber `klp/klmgn` 路线。
 //!
-//! 路线（KaLa5）：
+//! 含 κ/ch 的路线（KaLa5）：
 //! - λ_i 按 Mumford 生成函数展开为奇 ch：
 //!   `λ_n = [t^n] exp( Σ_i ch_{2i−1}·(2i−2)!·t^{2i−1} )`（偶 ch 在 M_g 消没）；
 //! - g=1 带一个 ch₁：恒等式 1/24·∫_{M̄_{0,n+2}}（类不变、双标记结构）；
@@ -18,6 +19,8 @@ use crate::push::push;
 use crate::socle::bernoulli;
 use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
+
+mod psi;
 
 fn fact(n: u64) -> Q {
     let mut r = Q::ONE;
@@ -431,6 +434,10 @@ fn fund_monomial(
 }
 
 /// 完整 klp：∫_{M̄_{g,n}} κ^κ·ψ^ψ·λ^λ·ch^ch。
+///
+/// 纯 λ-ψ 的较大查询自动并行（默认最多 24 个可用线程）。
+/// `SC_FABER_THREADS=1` 使用串行递归；正整数可指定并行线程数上限。
+/// 并行任务共享已完成的子积分，同一调用线程的后续查询继续复用结果。
 pub fn klp(
     g: u32,
     n: u32,
@@ -451,6 +458,9 @@ pub fn klp(
     }
     if g == 0 && ch.iter().any(|&(c, p)| p > 0 && c > 0) {
         return Ok(Q::ZERO);
+    }
+    if kappa.is_empty() && ch.is_empty() {
+        return Ok(psi::integrate(g, n, psi, lambda));
     }
     // λ → ch
     let mut ch_poly: Vec<ChMono> = vec![(vec![], Q::ONE)];
