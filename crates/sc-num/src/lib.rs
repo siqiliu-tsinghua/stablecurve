@@ -9,6 +9,8 @@
 
 pub use malachite_q::Rational as Q;
 
+pub mod parallel;
+
 // ZERO/ONE 常量经由 traits 提供，重导出给本 crate 各模块使用
 pub use malachite_base::num::basic::traits::{One, Zero};
 

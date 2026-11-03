@@ -105,12 +105,27 @@ pub fn int_against(cl: &TautClass, kappa: &[(u32, u32)], psi: &[(u32, u32)]) -> 
     if let Some(t) = cl.terms.first() {
         crate::kppoly::check_marking_legs(psi, t.graph.num_markings())?;
     }
-    let mut pairing = Pairing::new(kappa, psi);
-    let mut total = Q::ZERO;
-    for t in &cl.terms {
-        total += pairing.evaluate(&t.graph, &t.poly)?;
+    if cl.terms.len() < 32 {
+        let mut pairing = Pairing::new(kappa, psi);
+        return cl.terms.iter().try_fold(Q::ZERO, |sum, t| {
+            Ok(sum + pairing.evaluate(&t.graph, &t.poly)?)
+        });
     }
-    Ok(total)
+    let threads = sc_num::parallel::thread_count("SC_FABER_THREADS", 16);
+    sc_num::parallel::chunks(
+        cl.terms.len(),
+        8,
+        threads,
+        || Pairing::new(kappa, psi),
+        |pairing, mut range| {
+            range.try_fold(Q::ZERO, |sum, i| {
+                let t = &cl.terms[i];
+                Ok(sum + pairing.evaluate(&t.graph, &t.poly)?)
+            })
+        },
+    )
+    .into_iter()
+    .try_fold(Q::ZERO, |sum, part: Result<Q, String>| Ok(sum + part?))
 }
 
 /// Reuses external kappa distributions and graph automorphisms while streaming terms.
@@ -292,17 +307,9 @@ fn apoly_eval(p: &APoly, a: &[Q]) -> Q {
 }
 
 /// [`edge_coeff_calc`] 的记忆化（只依赖 (e1, e2)，展开代价随 e1+e2 指数增长）。
-fn edge_coeff(e1: u32, e2: u32) -> std::rc::Rc<APoly> {
-    thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<(u32, u32), std::rc::Rc<APoly>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    if let Some(p) = MEMO.with(|m| m.borrow().get(&(e1, e2)).cloned()) {
-        return p;
-    }
-    let p = std::rc::Rc::new(edge_coeff_calc(e1, e2));
-    MEMO.with(|m| m.borrow_mut().insert((e1, e2), p.clone()));
-    p
+fn edge_coeff(e1: u32, e2: u32) -> std::sync::Arc<APoly> {
+    static MEMO: crate::flow::SharedTable<(u32, u32), APoly> = crate::flow::SharedTable::new();
+    MEMO.get((e1, e2), || edge_coeff_calc(e1, e2))
 }
 
 /// edge_power_series：h = (1−exp(Σ_i A_i(X^{i+1}−(−Y)^{i+1})))/(X+Y)
@@ -357,17 +364,10 @@ fn edge_coeff_calc(e1: u32, e2: u32) -> APoly {
 
 /// 边因子表 [econtrib(e1, e2, w, m)]_{w=0..m−1}，spin 时偶 w 记 0
 /// （按 (e1, e2, m, spin) 跨生成元缓存：同一批插值点被全部生成元共用）。
-fn econtrib_table(e1: u32, e2: u32, m: i64, spin: bool) -> std::rc::Rc<Vec<Q>> {
-    type Key = (u32, u32, i64, bool);
-    thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<Vec<Q>>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    let key = (e1, e2, m, spin);
-    if let Some(t) = MEMO.with(|c| c.borrow().get(&key).cloned()) {
-        return t;
-    }
-    let t: std::rc::Rc<Vec<Q>> = std::rc::Rc::new(
+fn econtrib_table(e1: u32, e2: u32, m: i64, spin: bool) -> std::sync::Arc<Vec<Q>> {
+    static MEMO: crate::flow::SharedTable<(u32, u32, i64, bool), Vec<Q>> =
+        crate::flow::SharedTable::new();
+    MEMO.get((e1, e2, m, spin), || {
         (0..m)
             .map(|w| {
                 if spin && w % 2 == 0 {
@@ -376,10 +376,8 @@ fn econtrib_table(e1: u32, e2: u32, m: i64, spin: bool) -> std::rc::Rc<Vec<Q>> {
                     econtrib(e1, e2, w, m)
                 }
             })
-            .collect(),
-    );
-    MEMO.with(|c| c.borrow_mut().insert(key, t.clone()));
-    t
+            .collect()
+    })
 }
 
 /// econtrib(e1, e2, w1, r)。
@@ -607,7 +605,7 @@ fn chiodo_coeff_at(
     // 边因子按 w ∈ 0..m 制表。我们的 w 满足 Bw = −given，参考的 v 满足
     // Bv = given，故 w = −v；参考代入 −v，我们应代入 w（codex 仲裁
     // 2026-10-05）。spin 时只数奇权重：偶 w 记 0。
-    let tables: Vec<std::rc::Rc<Vec<Q>>> = exps_fine
+    let tables: Vec<std::sync::Arc<Vec<Q>>> = exps_fine
         .iter()
         .map(|&(e1, e2)| econtrib_table(e1, e2, m, spin))
         .collect();
@@ -632,15 +630,9 @@ fn chiodo_coeff_at(
 /// 拉格朗日插值 P(r) 后取 P(0)。spin=true（CSS21 spin DR cycle）：m 取偶数、
 /// 仅奇权重、因子 1/2^{g−h0}，要求 A 全奇且 k 奇。
 pub fn dr_chiodo_poly(g: u32, a: &[i64], d: u32, k: i64, spin: bool) -> Result<TautClass, String> {
-    let mut terms = Vec::new();
-    visit_chiodo_poly(g, a, d, k, spin, None, &mut |graph, poly| {
-        terms.push(DecStratum {
-            graph: graph.clone(),
-            poly,
-        });
-        Ok(())
-    })?;
-    Ok(TautClass::new(terms))
+    with_chiodo_poly(g, a, d, k, spin, None, |degree, visit| {
+        crate::graph_sum::collect(g, a.len() as u32, degree, visit).map(TautClass::new)
+    })
 }
 
 /// 插值 DR 类与 κ-ψ 的积分；逐顶点剪枝并逐项求值。
@@ -654,24 +646,20 @@ pub fn int_dr_chiodo_poly(
     psi: &[(u32, u32)],
 ) -> Result<Q, String> {
     crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
-    let mut pairing = Pairing::new(kappa, psi);
-    let mut total = Q::ZERO;
-    visit_chiodo_poly(g, a, d, k, spin, Some(psi), &mut |graph, poly| {
-        total += pairing.evaluate(graph, &poly)?;
-        Ok(())
-    })?;
-    Ok(total)
+    with_chiodo_poly(g, a, d, k, spin, Some(psi), |degree, visit| {
+        crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
+    })
 }
 
-fn visit_chiodo_poly(
+fn with_chiodo_poly<R>(
     g: u32,
     a: &[i64],
     d: u32,
     k: i64,
     spin: bool,
     external_psi: Option<&[(u32, u32)]>,
-    emit: &mut impl FnMut(&StableGraph, KP) -> Result<(), String>,
-) -> Result<(), String> {
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
     let n = a.len() as u32;
     let asum: i64 = a.iter().sum();
     let chi = 2 * g as i64 - 2 + n as i64;
@@ -696,46 +684,49 @@ fn visit_chiodo_poly(
     let npts = 2 * d as usize + 2;
     let step = if spin { 2 } else { 1 };
     let interpolator = ZeroInterpolator::new(step * start, step, npts);
-    let mut prepared: Option<(StableGraph, ChiodoGeometry)> = None;
-    visit_tautgens(g, n, d, external_psi, &mut |graph, poly| {
-        if prepared
-            .as_ref()
-            .is_none_or(|(previous, _)| previous != graph)
-        {
-            prepared = Some((graph.clone(), ChiodoGeometry::new(graph, a, k)));
-        }
-        let geometry = &prepared.as_ref().unwrap().1;
-        // 逐点求值
-        let mut vals: Vec<Q> = Vec::with_capacity(npts);
-        for i in 0..npts {
-            let m = if spin {
-                2 * (start + i as i64)
-            } else {
-                start + i as i64
-            };
-            let (c, h0) = chiodo_coeff_at(graph, &poly.terms[0], a, d, k, m, spin, geometry)?;
-            // spin 因子 1/2^{g−h0}
-            let mut c = c;
-            if spin {
-                for _ in 0..(g as i64 - h0) {
-                    c /= Q::from(2);
+    consume(d, &|graph, emit| {
+        let mut prepared = None;
+        crate::generators::visit_monomials(
+            graph,
+            d - graph.codim(),
+            false,
+            external_psi,
+            &mut |poly| {
+                let geometry = prepared.get_or_insert_with(|| ChiodoGeometry::new(graph, a, k));
+                // 逐点求值
+                let mut vals: Vec<Q> = Vec::with_capacity(npts);
+                for i in 0..npts {
+                    let m = if spin {
+                        2 * (start + i as i64)
+                    } else {
+                        start + i as i64
+                    };
+                    let (c, h0) =
+                        chiodo_coeff_at(graph, &poly.terms[0], a, d, k, m, spin, geometry)?;
+                    // spin 因子 1/2^{g−h0}
+                    let mut c = c;
+                    if spin {
+                        for _ in 0..(g as i64 - h0) {
+                            c /= Q::from(2);
+                        }
+                    }
+                    vals.push(c);
                 }
-            }
-            vals.push(c);
-        }
-        // 拉格朗日 P(0) = Σ_i v_i Π_{j≠i} (−m_j)/(m_i−m_j)
-        let p0 = interpolator.evaluate(&vals);
-        if !is_zero(&p0) {
-            emit(
-                graph,
-                KP::new(vec![KpTerm {
-                    kappa: poly.terms[0].kappa.clone(),
-                    psi: poly.terms[0].psi.clone(),
-                    coeff: p0,
-                }]),
-            )?;
-        }
-        Ok(())
+                // 拉格朗日 P(0) = Σ_i v_i Π_{j≠i} (−m_j)/(m_i−m_j)
+                let p0 = interpolator.evaluate(&vals);
+                if !is_zero(&p0) {
+                    emit(
+                        graph,
+                        KP::new(vec![KpTerm {
+                            kappa: poly.terms[0].kappa.clone(),
+                            psi: poly.terms[0].psi.clone(),
+                            coeff: p0,
+                        }]),
+                    )?;
+                }
+                Ok(())
+            },
+        )
     })
 }
 

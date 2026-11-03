@@ -114,6 +114,100 @@ struct Term {
     right: usize,
 }
 
+// 常见系数是半整数，节点编号也远小于 2^32。半整数分子与两个 u32
+// 共占 16 字节；超过任一范围的项放到 wide，保持任意精度和 usize 索引。
+struct CompactTerm {
+    numerator: i64,
+    left: u32,
+    right: u32,
+}
+
+const LINEAR: u32 = u32::MAX;
+const WIDE: u32 = u32::MAX - 1;
+
+#[derive(Default)]
+struct TermBlock {
+    compact: Vec<CompactTerm>,
+    wide: Vec<Term>,
+}
+
+impl TermBlock {
+    fn len(&self) -> usize {
+        self.compact.len()
+    }
+
+    fn push(&mut self, term: Term) {
+        let numerator = match &term.factor {
+            Coefficient::Integer(value) => value.checked_mul(2),
+            Coefficient::Half(value) => Some(*value),
+            Coefficient::Rational(_) => None,
+        };
+        if let Some(numerator) = numerator.filter(|_| {
+            term.left < WIDE as usize && (term.right == usize::MAX || term.right < WIDE as usize)
+        }) {
+            self.compact.push(CompactTerm {
+                numerator,
+                left: term.left as u32,
+                right: if term.right == usize::MAX {
+                    LINEAR
+                } else {
+                    term.right as u32
+                },
+            });
+        } else {
+            self.compact.push(CompactTerm {
+                // Vec<Term> 长度受 isize::MAX / size_of::<Term>() 限制。
+                numerator: self.wide.len() as i64,
+                left: 0,
+                right: WIDE,
+            });
+            self.wide.push(term);
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.compact.shrink_to_fit();
+        self.wide.shrink_to_fit();
+    }
+
+    fn evaluate(
+        &self,
+        range: std::ops::Range<usize>,
+        constant: &Q,
+        divisor: Option<&Q>,
+        values: &[Q],
+    ) -> Q {
+        let mut sum = constant.clone();
+        for term in &self.compact[range] {
+            let value = if term.right == WIDE {
+                let wide = &self.wide[term.numerator as usize];
+                let mut value = wide.factor.multiply(&values[wide.left]);
+                if wide.right != usize::MAX {
+                    value *= &values[wide.right];
+                }
+                value
+            } else {
+                let left = &values[term.left as usize];
+                let mut value = match term.numerator {
+                    2 => left.clone(),
+                    -2 => -left,
+                    n if n % 2 == 0 => Q::from(n / 2) * left,
+                    n => Q::from_signeds(n, 2) * left,
+                };
+                if term.right != LINEAR {
+                    value *= &values[term.right as usize];
+                }
+                value
+            };
+            sum += value;
+        }
+        if let Some(divisor) = divisor {
+            sum /= divisor;
+        }
+        sum
+    }
+}
+
 #[derive(Default)]
 struct Equation {
     constant: Q,
@@ -168,6 +262,7 @@ impl Equation {
     }
 }
 
+#[cfg(test)]
 fn evaluate_terms(constant: &Q, terms: &[Term], divisor: Option<&Q>, values: &[Q]) -> Q {
     let mut sum = constant.clone();
     for term in terms {
@@ -195,16 +290,16 @@ struct PackedEquation {
 struct Plan {
     equations: Vec<PackedEquation>,
     // 每个展开批次只保留一个连续块；避免为数百万个求和式单独分配和释放。
-    terms: Vec<Vec<Term>>,
+    terms: Vec<TermBlock>,
     layers: Vec<Vec<usize>>,
 }
 
 impl Plan {
     fn evaluate(&self, id: usize, values: &[Q]) -> Q {
         let equation = &self.equations[id];
-        evaluate_terms(
+        self.terms[equation.block].evaluate(
+            equation.terms.clone(),
             &equation.constant,
-            &self.terms[equation.block][equation.terms.clone()],
             equation.divisor.as_ref(),
             values,
         )
@@ -213,7 +308,7 @@ impl Plan {
 
 pub(super) fn integrate(
     g: u32,
-    d: &[u32],
+    descendants: &[(Vec<u32>, Q)],
     poly: &[ChMono],
     tables: &mut Descendents,
     threads: usize,
@@ -229,7 +324,9 @@ pub(super) fn integrate(
             .max()
             .unwrap_or(0) as usize;
         // W_ch + (2g−2+n) 沿每条递归边不增加。
-        let bound = weight + 2 * g as usize + d.len() - 2;
+        let bound =
+            (weight + 2 * g as usize + descendants.iter().map(|(d, _)| d.len()).max().unwrap_or(0))
+                .saturating_sub(2);
         if engine.index.len() <= weight {
             engine.index.resize_with(weight + 1, Vec::new);
         }
@@ -241,10 +338,12 @@ pub(super) fn integrate(
         let next = AtomicUsize::new(base);
         let (roots, mut plan) = {
             let mut planner = Planner::new(&engine, &tables.values, &next);
-            let roots: Vec<_> = poly
-                .iter()
-                .map(|(ch, c)| (planner.node(g, d.to_vec(), ch), c))
-                .collect();
+            let mut roots = Vec::new();
+            for (d, factor) in descendants {
+                for (ch, c) in poly {
+                    roots.push((planner.node(g, d.clone(), ch), factor * c));
+                }
+            }
             let plan = build_plan(&mut planner, threads);
             (roots, plan)
         };
@@ -260,7 +359,7 @@ pub(super) fn integrate(
                 planning,
                 start.elapsed(),
                 plan.equations.len(),
-                plan.terms.iter().map(Vec::len).sum(),
+                plan.terms.iter().map(TermBlock::len).sum(),
             );
         }
         // 连续块分摊给工作线程释放，大有理数系数也在这里析构。
@@ -270,7 +369,7 @@ pub(super) fn integrate(
                 for blocks in plan.terms.chunks_mut(chunk) {
                     scope.spawn(move || {
                         for block in blocks {
-                            *block = Vec::new();
+                            *block = TermBlock::default();
                         }
                     });
                 }
@@ -520,7 +619,7 @@ struct BuildJob {
 struct Built {
     discovered: Vec<State>,
     equations: Vec<(usize, (u32, u32), PackedEquation)>,
-    terms: Vec<Term>,
+    terms: TermBlock,
 }
 
 impl Built {
@@ -546,13 +645,15 @@ impl Built {
 impl Planner<'_> {
     fn build(&mut self, job: BuildJob) -> Built {
         let mut equations = Vec::with_capacity(job.end - job.start);
-        let mut terms = Vec::new();
+        let mut terms = TermBlock::default();
         let mut scratch = Vec::new();
         for state in &job.states[job.start..job.end] {
             let mut equation = self.expand(state.g, &state.d, &state.ch, scratch);
             equation.collect();
             let start = terms.len();
-            terms.append(&mut equation.terms);
+            for term in equation.terms.drain(..) {
+                terms.push(term);
+            }
             scratch = equation.terms;
             equations.push((
                 state.index,
@@ -901,6 +1002,54 @@ mod tests {
             let coefficient = Coefficient::new(factor.clone());
             assert_eq!(coefficient.rational(), factor);
             assert_eq!(coefficient.multiply(&value), &factor * &value);
+        }
+    }
+
+    #[test]
+    fn packed_terms_keep_exact_coefficients_and_wide_indices() {
+        assert_eq!(std::mem::size_of::<CompactTerm>(), 16);
+        let values = [Q::from_signeds(7, 11), Q::from_signeds(-13, 17)];
+        let mut block = TermBlock::default();
+        let mut expected = Q::from(3);
+        for factor in [
+            Q::ONE,
+            -Q::ONE,
+            Q::from_signeds(-3, 2),
+            Q::from_signeds(5, 7),
+            Q::from(i64::MIN),
+            Q::from(i64::MAX) * Q::from(2),
+        ] {
+            for right in [usize::MAX, 1] {
+                let mut value = &factor * &values[0];
+                if right != usize::MAX {
+                    value *= &values[right];
+                }
+                expected += value;
+                block.push(Term {
+                    factor: Coefficient::new(factor.clone()),
+                    left: 0,
+                    right,
+                });
+            }
+        }
+        assert_eq!(
+            block.evaluate(0..block.len(), &Q::from(3), Some(&Q::from(23)), &values),
+            expected / Q::from(23)
+        );
+        for (left, right) in [
+            (WIDE as usize, usize::MAX),
+            (0, WIDE as usize),
+            (usize::MAX, usize::MAX),
+        ] {
+            block.push(Term {
+                factor: Coefficient::Integer(1),
+                left,
+                right,
+            });
+            let packed = block.compact.last().unwrap();
+            assert_eq!(packed.right, WIDE);
+            let wide = &block.wide[packed.numerator as usize];
+            assert_eq!((wide.left, wide.right), (left, right));
         }
     }
 

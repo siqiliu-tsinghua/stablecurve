@@ -26,6 +26,10 @@ pub(crate) fn psi_integral(g: u32, powers: &[u32]) -> Q {
     psi::pure(g, powers)
 }
 
+pub(crate) fn psi_sum(g: u32, roots: &[(Vec<u32>, Q)]) -> Q {
+    psi::pure_sum(g, roots)
+}
+
 fn fact(n: u64) -> Q {
     let mut r = Q::ONE;
     for i in 2..=n {

@@ -8,11 +8,9 @@
 //! 整体 ×(−1)^{d−g}。
 
 use crate::flow::{FlowTopology, ZeroInterpolator};
-use crate::generators::visit_tautgens;
-use crate::graph::StableGraph;
 use crate::kppoly::{KappaPsiPolynomial as KP, KpTerm};
 use crate::socle::bernoulli;
-use crate::taut::{DecStratum, TautClass};
+use crate::taut::TautClass;
 use sc_num::{One, Q, Zero};
 
 type PX = Vec<Q>; // X 多项式（升幂，可含尾部零）
@@ -97,17 +95,9 @@ fn sum_pow_coeffs(k: u32) -> PX {
 /// P_d(X,a)：a-多项式（外层升幂），系数 ∈ QQ[X]。
 /// [`pm_poly_calc`] 的记忆化：P_d 只依赖 d，而每层递推都是整套多项式运算；
 /// leg_factor/edge_factor 在权重枚举中被反复调用，不缓存时每次都从 P_0 重建。
-fn pm_poly(d: u32) -> std::rc::Rc<Vec<PX>> {
-    thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<u32, std::rc::Rc<Vec<PX>>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    if let Some(p) = MEMO.with(|m| m.borrow().get(&d).cloned()) {
-        return p;
-    }
-    let p = std::rc::Rc::new(pm_poly_calc(d));
-    MEMO.with(|m| m.borrow_mut().insert(d, p.clone()));
-    p
+fn pm_poly(d: u32) -> std::sync::Arc<Vec<PX>> {
+    static MEMO: crate::flow::SharedTable<u32, Vec<PX>> = crate::flow::SharedTable::new();
+    MEMO.get(d, || pm_poly_calc(d))
 }
 
 fn pm_poly_calc(d: u32) -> Vec<PX> {
@@ -310,19 +300,12 @@ pub fn edge_factor(w1: i64, m: i64, d1: u32, d2: u32) -> Q {
 }
 
 /// 边因子表 [edge_factor(x, m, d1, d2)]_{x=0..m−2}（按 (d1, d2, m) 跨生成元缓存）。
-fn edge_table(d1: u32, d2: u32, m: i64) -> std::rc::Rc<Vec<Q>> {
-    type Key = (u32, u32, i64);
-    thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<Vec<Q>>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    if let Some(t) = MEMO.with(|c| c.borrow().get(&(d1, d2, m)).cloned()) {
-        return t;
-    }
-    let t: std::rc::Rc<Vec<Q>> =
-        std::rc::Rc::new((0..m - 1).map(|x| edge_factor(x, m, d1, d2)).collect());
-    MEMO.with(|c| c.borrow_mut().insert((d1, d2, m), t.clone()));
-    t
+fn edge_table(d1: u32, d2: u32, m: i64) -> std::sync::Arc<Vec<Q>> {
+    static MEMO: crate::flow::SharedTable<(u32, u32, i64), Vec<Q>> =
+        crate::flow::SharedTable::new();
+    MEMO.get((d1, d2, m), || {
+        (0..m - 1).map(|x| edge_factor(x, m, d1, d2)).collect()
+    })
 }
 
 fn num_lcm(a: i64, b: i64) -> i64 {
@@ -344,15 +327,10 @@ fn num_gcd(a: i64, b: i64) -> i64 {
 /// ≡ 0 mod (m−1)；v(m) = total·(m−1)^{−h₀}·scalar(m)；插值点步长
 /// step = lcm(C 分母)，P(0) 拉格朗日，整体 ×(−1)^{d−g}（d = g−1+ΣC）。
 pub fn witten_class(g: u32, a: &[(i64, i64, i64)]) -> Result<TautClass, String> {
-    let mut terms = Vec::new();
-    visit_witten(g, a, None, &mut |graph, poly| {
-        terms.push(DecStratum {
-            graph: graph.clone(),
-            poly,
-        });
-        Ok(())
-    })?;
-    Ok(TautClass::new(terms))
+    with_witten(g, a, None, |degree, visit| {
+        crate::graph_sum::collect(g, a.len() as u32, degree, visit)
+    })
+    .map(TautClass::new)
 }
 
 /// Witten 类与 κ-ψ 的积分；避免构造完整装饰类。
@@ -363,28 +341,24 @@ pub fn int_witten(
     psi: &[(u32, u32)],
 ) -> Result<Q, String> {
     crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
-    let mut pairing = crate::classes::Pairing::new(kappa, psi);
-    let mut total = Q::ZERO;
-    visit_witten(g, a, Some(psi), &mut |graph, poly| {
-        total += pairing.evaluate(graph, &poly)?;
-        Ok(())
-    })?;
-    Ok(total)
+    with_witten(g, a, Some(psi), |degree, visit| {
+        crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
+    })
 }
 
-fn visit_witten(
+fn with_witten<R: Default>(
     g: u32,
     a: &[(i64, i64, i64)],
     external_psi: Option<&[(u32, u32)]>,
-    emit: &mut impl FnMut(&StableGraph, KP) -> Result<(), String>,
-) -> Result<(), String> {
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
     let n = a.len() as u32;
     let dsum: i64 = a.iter().map(|&(_, _, d)| d).sum();
     if dsum != 2 * g as i64 - 2 {
         return Err(format!("ΣD={dsum} ≠ 2g−2={}", 2 * g as i64 - 2));
     }
     if a.iter().any(|&(cn, cd, d)| cn == cd && d == -1) {
-        return Ok(());
+        return Ok(R::default());
     }
     let mut step: i64 = 1;
     for &(_, cd, _) in a {
@@ -405,111 +379,113 @@ fn visit_witten(
     let interpolators: Vec<_> = (0..=d_deg)
         .map(|s| ZeroInterpolator::new(m0 + step, step, 2 * s as usize + 1))
         .collect();
-    let mut prepared: Option<(StableGraph, FlowTopology)> = None;
-    visit_tautgens(g, n, d_deg, external_psi, &mut |graph, poly| {
-        let nv = graph.vertices().len();
-        let t = &poly.terms[0];
-        let ne = graph.edges().len();
-        let h0 = ne as i64 - nv as i64 + 1;
-        // 边表（顶点对 + 半边 ψ 幂）
-        let owner = graph.leg_owner();
-        let mut edges_v: Vec<(usize, usize)> = Vec::new();
-        let mut exps: Vec<(u32, u32)> = Vec::new();
-        for &(ea, eb) in graph.edges() {
-            edges_v.push((owner[ea as usize], owner[eb as usize]));
-            exps.push((t.psi_power_at(ea), t.psi_power_at(eb)));
-        }
-        let exp_sum: u32 = exps.iter().map(|&(e1, e2)| e1 + e2).sum();
-        let deg = 2 * exp_sum as i64 + 2 * ne as i64;
-        let npts = deg as usize + 1;
-        if prepared
-            .as_ref()
-            .is_none_or(|(previous, _)| previous != graph)
-        {
-            prepared = Some((graph.clone(), FlowTopology::new(&edges_v, nv)));
-        }
-        let topology = &prepared.as_ref().unwrap().1;
-        let mut vals: Vec<Q> = Vec::with_capacity(npts);
-        // scalar 在 X=0 处的符号因子值（腿/κ 因子不参与插值——参考
-        // interp(X)·scalar(X) 结构：插值只对 total·(m−1)^{−h0}）
-        let mut scalar0 = Q::ONE;
-        for vi in 0..nv {
-            for &idx in &t.kappa[vi] {
-                scalar0 = scalar0 * leg_factor(idx, 0, 0) * Q::from(-1);
-            }
-        }
-        for (li, &(_, _, dd)) in a.iter().enumerate().take(n as usize) {
-            let l = li as u32 + 1;
-            let e = t.psi_power_at(l);
-            scalar0 *= leg_factor(e, dd, 0);
-        }
-        if scalar0 == Q::ZERO {
-            return Ok(());
-        }
-        let mut base: Vec<i64> = graph
-            .vertices()
-            .iter()
-            .zip(&t.kappa)
-            .map(|(v, kap)| 1 - v.genus as i64 - kap.iter().map(|&i| i as i64).sum::<i64>())
-            .collect();
-        let mut slope = vec![0i64; nv];
-        for (li, &(cn, cd, dd)) in a.iter().enumerate() {
-            let vi = owner[li + 1];
-            base[vi] += dd - t.psi_power_at(li as u32 + 1) as i64;
-            slope[vi] += cn * (step / cd);
-        }
-        for (&(_, v), &(e1, e2)) in edges_v.iter().zip(&exps) {
-            base[v] -= 2 + e1 as i64 + e2 as i64;
-        }
-        for i in 0..npts {
-            let m = m0 + step * (i as i64 + 1);
-            // given 权重与 scalar（每 m 重算）
-            // 给定权初值 = 1 − g_v（Pixton M[i,0][0] = genus；g=1 主图
-            // 锚点反推验证接受条件成立）
-            let given: Vec<i64> = base
-                .iter()
-                .zip(&slope)
-                .map(|(&b, &s)| b + s * (m / step))
-                .collect();
-            // 边权枚举 mod (m−1)：起点 += x、终点 −= x+2+e₁+e₂。常数部分
-            // 并入给定值，剩下的 ±x 即平衡流；边因子按 x ∈ 0..m−1 制表
-            // （同 (e₁, e₂) 的边共用一张表）
-            let mm = m - 1;
-            let tables: Vec<std::rc::Rc<Vec<Q>>> =
-                exps.iter().map(|&(e1, e2)| edge_table(e1, e2, m)).collect();
-            let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
-            let total = topology.sum(&given, mm, &table);
-            // total·(m−1)^{−h0}：参考 mvalues.append(total * ZZ(m-1)**(-h0))
-            let mut mpow = Q::ONE;
-            for _ in 0..h0 {
-                mpow /= Q::from(mm);
-            }
-            for _ in 0..(-h0) {
-                mpow *= Q::from(mm);
-            }
-            vals.push(total * mpow);
-        }
-        // 拉格朗日 P(0)
-        let p0 = interpolators[exp_sum as usize + ne].evaluate(&vals);
-        let sgn = Q::from(if ((d_deg as i64 - g as i64) % 2 + 2) % 2 == 0 {
-            1
-        } else {
-            -1
-        });
-        let coeff = p0 * sgn * scalar0;
-        if coeff != Q::ZERO {
-            // coeff = mpoly(0)·sgn 已是类系数口径（= aut × oracle 生成元
-            // 系数）；evaluate 统一除 aut，勿在此再乘
-            emit(
-                graph,
-                KP::new(vec![KpTerm {
-                    kappa: t.kappa.clone(),
-                    psi: t.psi.clone(),
-                    coeff,
-                }]),
-            )?;
-        }
-        Ok(())
+    consume(d_deg, &|graph, emit| {
+        let mut prepared = None;
+        crate::generators::visit_monomials(
+            graph,
+            d_deg - graph.codim(),
+            false,
+            external_psi,
+            &mut |poly| {
+                let nv = graph.vertices().len();
+                let t = &poly.terms[0];
+                let ne = graph.edges().len();
+                let h0 = ne as i64 - nv as i64 + 1;
+                // 边表（顶点对 + 半边 ψ 幂）
+                let owner = graph.leg_owner();
+                let mut edges_v: Vec<(usize, usize)> = Vec::new();
+                let mut exps: Vec<(u32, u32)> = Vec::new();
+                for &(ea, eb) in graph.edges() {
+                    edges_v.push((owner[ea as usize], owner[eb as usize]));
+                    exps.push((t.psi_power_at(ea), t.psi_power_at(eb)));
+                }
+                let exp_sum: u32 = exps.iter().map(|&(e1, e2)| e1 + e2).sum();
+                let deg = 2 * exp_sum as i64 + 2 * ne as i64;
+                let npts = deg as usize + 1;
+                let topology = prepared.get_or_insert_with(|| FlowTopology::new(&edges_v, nv));
+                let mut vals: Vec<Q> = Vec::with_capacity(npts);
+                // scalar 在 X=0 处的符号因子值（腿/κ 因子不参与插值——参考
+                // interp(X)·scalar(X) 结构：插值只对 total·(m−1)^{−h0}）
+                let mut scalar0 = Q::ONE;
+                for vi in 0..nv {
+                    for &idx in &t.kappa[vi] {
+                        scalar0 = scalar0 * leg_factor(idx, 0, 0) * Q::from(-1);
+                    }
+                }
+                for (li, &(_, _, dd)) in a.iter().enumerate().take(n as usize) {
+                    let l = li as u32 + 1;
+                    let e = t.psi_power_at(l);
+                    scalar0 *= leg_factor(e, dd, 0);
+                }
+                if scalar0 == Q::ZERO {
+                    return Ok(());
+                }
+                let mut base: Vec<i64> = graph
+                    .vertices()
+                    .iter()
+                    .zip(&t.kappa)
+                    .map(|(v, kap)| 1 - v.genus as i64 - kap.iter().map(|&i| i as i64).sum::<i64>())
+                    .collect();
+                let mut slope = vec![0i64; nv];
+                for (li, &(cn, cd, dd)) in a.iter().enumerate() {
+                    let vi = owner[li + 1];
+                    base[vi] += dd - t.psi_power_at(li as u32 + 1) as i64;
+                    slope[vi] += cn * (step / cd);
+                }
+                for (&(_, v), &(e1, e2)) in edges_v.iter().zip(&exps) {
+                    base[v] -= 2 + e1 as i64 + e2 as i64;
+                }
+                for i in 0..npts {
+                    let m = m0 + step * (i as i64 + 1);
+                    // given 权重与 scalar（每 m 重算）
+                    // 给定权初值 = 1 − g_v（Pixton M[i,0][0] = genus；g=1 主图
+                    // 锚点反推验证接受条件成立）
+                    let given: Vec<i64> = base
+                        .iter()
+                        .zip(&slope)
+                        .map(|(&b, &s)| b + s * (m / step))
+                        .collect();
+                    // 边权枚举 mod (m−1)：起点 += x、终点 −= x+2+e₁+e₂。常数部分
+                    // 并入给定值，剩下的 ±x 即平衡流；边因子按 x ∈ 0..m−1 制表
+                    // （同 (e₁, e₂) 的边共用一张表）
+                    let mm = m - 1;
+                    let tables: Vec<std::sync::Arc<Vec<Q>>> =
+                        exps.iter().map(|&(e1, e2)| edge_table(e1, e2, m)).collect();
+                    let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
+                    let total = topology.sum(&given, mm, &table);
+                    // total·(m−1)^{−h0}：参考 mvalues.append(total * ZZ(m-1)**(-h0))
+                    let mut mpow = Q::ONE;
+                    for _ in 0..h0 {
+                        mpow /= Q::from(mm);
+                    }
+                    for _ in 0..(-h0) {
+                        mpow *= Q::from(mm);
+                    }
+                    vals.push(total * mpow);
+                }
+                // 拉格朗日 P(0)
+                let p0 = interpolators[exp_sum as usize + ne].evaluate(&vals);
+                let sgn = Q::from(if ((d_deg as i64 - g as i64) % 2 + 2) % 2 == 0 {
+                    1
+                } else {
+                    -1
+                });
+                let coeff = p0 * sgn * scalar0;
+                if coeff != Q::ZERO {
+                    // coeff = mpoly(0)·sgn 已是类系数口径（= aut × oracle 生成元
+                    // 系数）；evaluate 统一除 aut，勿在此再乘
+                    emit(
+                        graph,
+                        KP::new(vec![KpTerm {
+                            kappa: t.kappa.clone(),
+                            psi: t.psi.clone(),
+                            coeff,
+                        }]),
+                    )?;
+                }
+                Ok(())
+            },
+        )
     })
 }
 

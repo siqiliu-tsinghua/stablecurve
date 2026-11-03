@@ -18,13 +18,10 @@
 //! 2ψ₁+9/2ψ₂+25/2ψ₃ −(1/12)[Δ₀] −(25/2)[3|12] −…（我们的 [Δ₀] = 物理轨迹类
 
 use crate::flow::{FlowTopology, ZeroInterpolator};
-use crate::graph::StableGraph;
 use crate::kppoly::KappaPsiPolynomial;
-use crate::taut::{DecStratum, TautClass};
+use crate::taut::TautClass;
 use sc_num::{One, Q, Zero, is_zero};
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 fn fact(n: u64) -> Q {
     let mut r = Q::ONE;
@@ -35,31 +32,18 @@ fn fact(n: u64) -> Q {
 }
 
 /// 边因子表 [w^{2s}]_{w=0..m−1}（按 (s, m) 跨生成元缓存）。
-fn weight_table(s: u32, m: i64) -> Rc<Vec<Q>> {
-    thread_local! {
-        static MEMO: RefCell<HashMap<(u32, i64), Rc<Vec<Q>>>> = RefCell::new(HashMap::new());
-    }
-    if let Some(t) = MEMO.with(|c| c.borrow().get(&(s, m)).cloned()) {
-        return t;
-    }
-    let t: Rc<Vec<Q>> = Rc::new(
+fn weight_table(s: u32, m: i64) -> std::sync::Arc<Vec<Q>> {
+    static MEMO: crate::flow::SharedTable<(u32, i64), Vec<Q>> = crate::flow::SharedTable::new();
+    MEMO.get((s, m), || {
         (0..m)
-            .map(|w| {
-                let mut t = Q::ONE;
-                for _ in 0..2 * s {
-                    t *= Q::from(w);
-                }
-                t
-            })
-            .collect(),
-    );
-    MEMO.with(|c| c.borrow_mut().insert((s, m), t.clone()));
-    t
+            .map(|w| sc_num::pow_unsigned(&Q::from(w), 2 * u64::from(s)))
+            .collect()
+    })
 }
 
 /// 平衡权重系统的和：Σ Π_e w_e^{2 exp_e}（mod m 平衡，u 出边 +w、v 入边 −w）。
 fn balanced_weight_sum(topology: &FlowTopology, exps: &[u32], given: &[i64], m: i64) -> Q {
-    let tables: Vec<Rc<Vec<Q>>> = exps.iter().map(|&s| weight_table(s, m)).collect();
+    let tables: Vec<std::sync::Arc<Vec<Q>>> = exps.iter().map(|&s| weight_table(s, m)).collect();
     let table: Vec<&[Q]> = tables.iter().map(|t| t.as_slice()).collect();
     topology.sum(given, m, &table)
 }
@@ -81,25 +65,19 @@ fn dr_cycle_impl(
     r: Option<u32>,
     gen_norm: bool,
 ) -> Result<TautClass, String> {
-    let mut terms = Vec::new();
-    visit_dr(g, dvector, r, gen_norm, None, &mut |graph, poly| {
-        terms.push(DecStratum {
-            graph: graph.clone(),
-            poly,
-        });
-        Ok(())
-    })?;
-    Ok(TautClass::new(terms))
+    with_dr(g, dvector, r, gen_norm, None, |degree, visit| {
+        crate::graph_sum::collect(g, dvector.len() as u32, degree, visit).map(TautClass::new)
+    })
 }
 
-fn visit_dr(
+fn with_dr<R>(
     g: u32,
     dvector: &[i64],
     r: Option<u32>,
     gen_norm: bool,
     external_psi: Option<&[(u32, u32)]>,
-    emit: &mut impl FnMut(&StableGraph, KappaPsiPolynomial) -> Result<(), String>,
-) -> Result<(), String> {
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
     let n = dvector.len() as u32;
     let r = dr_degree(g, dvector, r)?;
     let m0 = (dvector.iter().map(|d| d.abs()).sum::<i64>() + 1) / 2;
@@ -107,46 +85,47 @@ fn visit_dr(
     let interpolators: Vec<_> = (0..=r)
         .map(|s| ZeroInterpolator::new(m0 + 1, 1, 2 * s as usize + 2))
         .collect();
-    // 含 κ 的生成元系数为 0（kval = 0），只枚举纯 ψ 装饰（顺序与 tautgens
-    // 中 κ 为空的部分一致）。顶点、给定值、圈秩逐图只算一次；Q_Γ(0) 只依赖
-    // 图与各结点的指数，图内按结点指数缓存。
-    for c in 0..=r {
-        for graph in crate::generators::layer(g, n, c).iter() {
-            let verts = graph.vertices();
-            let nv = verts.len();
-            let max_leg = verts
-                .iter()
-                .flat_map(|v| v.legs.iter().copied())
-                .max()
-                .unwrap_or(0) as usize;
-            let mut owner = vec![0usize; max_leg + 1];
-            for (i, v) in verts.iter().enumerate() {
-                for &l in &v.legs {
-                    owner[l as usize] = i;
-                }
+    consume(r, &|graph, emit| {
+        let verts = graph.vertices();
+        let nv = verts.len();
+        let max_leg = verts
+            .iter()
+            .flat_map(|v| v.legs.iter().copied())
+            .max()
+            .unwrap_or(0) as usize;
+        let mut owner = vec![0usize; max_leg + 1];
+        for (i, v) in verts.iter().enumerate() {
+            for &l in &v.legs {
+                owner[l as usize] = i;
             }
-            let edges_v: Vec<(usize, usize)> = graph
-                .edges()
-                .iter()
-                .map(|&(a, b)| (owner[a as usize], owner[b as usize]))
-                .collect();
-            let topology = FlowTopology::new(&edges_v, nv);
-            // given[v] = Σ_{v 的标记} d
-            let mut given = vec![0i64; nv];
-            for l in 1..=n {
-                given[owner[l as usize]] += dvector[(l - 1) as usize];
-            }
-            let b1 = (graph.edges().len() + 1) as i64 - nv as i64;
-            // 注意：admcycles 的 DR 系数含 1/autom_count（其生成元口径 ξ_*1）；
-            // 我们的 TautClass 口径为 ξ_*/|Aut|（evaluate 时统一除），故此处
-            // 不再放 1/aut，积分结果与 admcycles 直接可比。
-            let aut_scalar = if gen_norm {
-                Q::ONE / graph.automorphism_number()
-            } else {
-                Q::ONE
-            };
-            let mut q0_cache: HashMap<Vec<u32>, Q> = HashMap::new();
-            crate::generators::visit_monomials(graph, r - c, true, external_psi, &mut |poly| {
+        }
+        let edges_v: Vec<(usize, usize)> = graph
+            .edges()
+            .iter()
+            .map(|&(a, b)| (owner[a as usize], owner[b as usize]))
+            .collect();
+        let topology = FlowTopology::new(&edges_v, nv);
+        // given[v] = Σ_{v 的标记} d
+        let mut given = vec![0i64; nv];
+        for l in 1..=n {
+            given[owner[l as usize]] += dvector[(l - 1) as usize];
+        }
+        let b1 = (graph.edges().len() + 1) as i64 - nv as i64;
+        // 注意：admcycles 的 DR 系数含 1/autom_count（其生成元口径 ξ_*1）；
+        // 我们的 TautClass 口径为 ξ_*/|Aut|（evaluate 时统一除），故此处
+        // 不再放 1/aut，积分结果与 admcycles 直接可比。
+        let aut_scalar = if gen_norm {
+            Q::ONE / graph.automorphism_number()
+        } else {
+            Q::ONE
+        };
+        let mut q0_cache: HashMap<Vec<u32>, Q> = HashMap::new();
+        crate::generators::visit_monomials(
+            graph,
+            r - graph.codim(),
+            true,
+            external_psi,
+            &mut |poly| {
                 let t = &poly.terms[0];
                 // 标记部分：d^{2e}/e!
                 let mut scalar = aut_scalar.clone();
@@ -204,10 +183,10 @@ fn visit_dr(
                     )?;
                 }
                 Ok(())
-            })?;
-        }
-    }
-    Ok(())
+            },
+        )?;
+        Ok(())
+    })
 }
 
 fn dr_degree(g: u32, a: &[i64], r: Option<u32>) -> Result<u32, String> {
@@ -246,13 +225,9 @@ pub fn int_dr(
     if degree > g || weight != (3 * i64::from(g) - 3 + dvector.len() as i64) as u128 {
         return Ok(Q::ZERO);
     }
-    let mut pairing = crate::classes::Pairing::new(kappa, psi);
-    let mut total = Q::ZERO;
-    visit_dr(g, dvector, r, false, Some(psi), &mut |graph, poly| {
-        total += pairing.evaluate(graph, &poly)?;
-        Ok(())
-    })?;
-    Ok(total)
+    with_dr(g, dvector, r, false, Some(psi), |degree, visit| {
+        crate::graph_sum::integrate(g, dvector.len() as u32, degree, kappa, psi, visit)
+    })
 }
 
 #[cfg(test)]

@@ -10,10 +10,8 @@
 //! 互证：N_0(g, 2g−4)/(3g−3) = (−1)^{g+1}·∫_{M̄_{g−1}} λ_{g−2}³
 //! （h = 2,3,4 三点精确咬合，见测试）。
 
-use crate::comb::partition;
 use crate::qseries::{bernoulli, z_over_2sinh_coeff};
 use sc_num::{One, Q, Zero};
-use std::rc::Rc;
 
 fn fact(n: u32) -> Q {
     sc_num::factorial(n)
@@ -37,83 +35,35 @@ pub fn power(part: &[u32], l: u32) -> Q {
     pow + fact(l) * z_over_2sinh_coeff(l + 1)
 }
 
-/// Π 钩长 = d!/dim λ（Young 图钩子公式；0 基：
-/// h(i,j) = (λ_i−1−j) + (λ'_j−1−i) + 1，λ'_j = #{i : λ_i ≥ j+1}）。
-fn hook_product(part: &[u32]) -> Q {
-    let mut rows: Vec<u32> = part.to_vec();
-    rows.sort_unstable();
-    rows.reverse(); // 降序行
-    let col_len = |j: usize| -> usize { rows.iter().filter(|&&r| r > j as u32).count() };
-    let mut h = Q::ONE;
-    for (i, &ri) in rows.iter().enumerate() {
-        for j in 0..ri as usize {
-            let hook = (ri as i64 - 1 - j as i64) + (col_len(j) as i64 - 1 - i as i64) + 1;
-            h *= Q::from(hook);
+/// Young 图钩长乘积；先准备各列长度，逐格计算一次。
+pub(crate) fn hook_product(part: &[u32]) -> Q {
+    let mut rows = part.to_vec();
+    rows.sort_unstable_by(|a, b| b.cmp(a));
+    let mut columns = vec![0usize; rows.first().copied().unwrap_or(0) as usize];
+    for &row in &rows {
+        for height in &mut columns[..row as usize] {
+            *height += 1;
         }
     }
-    h
-}
-
-/// gwpoint 的分拆展开 ⟨Π τ_k(pt)⟩_{g,d} = Σ_{λ ⊢ d} w(λ)·Π_k f_λ(k) 中的
-/// (w(λ), λ)，w(λ) = (Π 钩长)^{2g−2}；f_λ 见 [`tau_factor`]。
-pub(crate) fn partition_weights(g: u32, d: u32) -> Rc<Vec<(Q, Vec<u32>)>> {
-    thread_local! {
-        static TABLE: std::cell::RefCell<std::collections::BTreeMap<(u32, u32), Rc<Vec<(Q, Vec<u32>)>>>> =
-            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
-    }
-    if let Some(value) = TABLE.with(|cell| cell.borrow().get(&(g, d)).cloned()) {
-        return value;
-    }
-    let e = 2 * g as i64 - 2;
-    let result = Rc::new(
-        partition(d)
-            .into_iter()
-            .map(|part| {
-                let base = hook_product(&part);
-                let w = if e >= 0 {
-                    sc_num::pow_unsigned(&base, e as u64)
-                } else {
-                    Q::ONE / q_pow(&base, (-e) as u32)
-                };
-                (w, part)
-            })
-            .collect(),
-    );
-    TABLE.with(|cell| cell.borrow_mut().insert((g, d), Rc::clone(&result)));
-    result
-}
-
-/// 单个点插入 τ_k(pt) 在分拆 λ 处的因子 f_λ(k) = power(λ, k+1)/(k+1)!。
-pub(crate) fn tau_factor(part: &[u32], k: u32) -> Q {
-    thread_local! {
-        static TABLE: std::cell::RefCell<std::collections::BTreeMap<Vec<u32>, Vec<Q>>> =
-            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
-    }
-    TABLE.with(|cell| {
-        let mut table = cell.borrow_mut();
-        if let Some(value) = table.get(part).and_then(|row| row.get(k as usize)) {
-            return value.clone();
+    let mut product = Q::ONE;
+    for (i, &row) in rows.iter().enumerate() {
+        for (j, &height) in columns[..row as usize].iter().enumerate() {
+            product *= Q::from(row as usize - j + height - i - 1);
         }
-        let row = table.entry(part.to_vec()).or_default();
-        while row.len() <= k as usize {
-            let l = row.len() as u32 + 1;
-            row.push(power(part, l) / fact(l));
-        }
-        row[k as usize].clone()
-    })
+    }
+    product
 }
 
 /// ⟨Π τ_{k_i}(pt)⟩_{g,d}（不连通；g 为 target 曲线亏格）。GWall `GWpoint`。
 pub fn gwpoint(g: u32, d: u32, tau: &[u32]) -> Q {
-    let mut answer = Q::ZERO;
-    for (w, part) in partition_weights(g, d).iter() {
+    let table = crate::precompute::prepare(g, d, tau.iter().copied().max().unwrap_or(0));
+    table.sum(tau.len().max(1), |w, factors| {
         let mut prod = w.clone();
         for &k in tau {
-            prod *= tau_factor(part, k);
+            prod *= &factors[k as usize];
         }
-        answer += prod;
-    }
-    answer
+        prod
+    })
 }
 
 /// 常映射贡献 N_0(g, b)（b 偶）。GWall `N_0`。

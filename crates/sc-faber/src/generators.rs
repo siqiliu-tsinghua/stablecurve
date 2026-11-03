@@ -40,19 +40,44 @@ pub(crate) fn layer(g: u32, n: u32, codim: u32) -> Rc<Vec<StableGraph>> {
         }
     };
     for _ in cached.len().max(1)..=codim as usize {
-        let mut seen: HashSet<StableGraph> = HashSet::new();
-        let mut next: Vec<StableGraph> = Vec::new();
-        for gr in prev.iter() {
-            for h in one_step_expansions(gr) {
-                if h.codim() == gr.codim() + 1 && seen.insert(h.clone()) {
-                    next.push(h);
-                }
-            }
-        }
-        prev = Rc::new(next);
+        prev = Rc::new(expand_layer(
+            &prev,
+            sc_num::parallel::thread_count("SC_FABER_THREADS", 16),
+        ));
         LAYERS.with(|m| m.borrow_mut().get_mut(&(g, n)).unwrap().push(prev.clone()));
     }
     prev
+}
+
+fn expand_layer(previous: &[StableGraph], threads: usize) -> Vec<StableGraph> {
+    let threads = if previous.len() < 16 {
+        1
+    } else {
+        threads.max(1)
+    };
+    let mut seen: HashSet<StableGraph> = HashSet::new();
+    let mut next = Vec::new();
+    // 图层依次生成，层内扩张独立；小批次限制未合并的临时图数量。
+    // chunks 按输入顺序返回，沿用串行枚举的发现顺序与去重逻辑。
+    for batch in previous.chunks(threads * 8) {
+        let expanded = sc_num::parallel::chunks(
+            batch.len(),
+            1,
+            threads,
+            || (),
+            |_, range| {
+                range
+                    .flat_map(|i| one_step_expansions(&batch[i]))
+                    .collect::<Vec<_>>()
+            },
+        );
+        for h in expanded.into_iter().flatten() {
+            if h.codim() == previous[0].codim() + 1 && seen.insert(h.clone()) {
+                next.push(h);
+            }
+        }
+    }
+    next
 }
 
 /// 清空图层缓存（本线程）。缓存随用随长，大的 (g, n, 余维) 可达数十万个图。
@@ -375,6 +400,15 @@ fn enum_psi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_expansion_preserves_serial_graph_order() {
+        let previous = layer(3, 2, 2);
+        assert!(previous.len() >= 16);
+        let serial = expand_layer(&previous, 1);
+        assert_eq!(serial, expand_layer(&previous, 4));
+        assert!(expand_layer(&[], 4).is_empty());
+    }
 
     #[test]
     fn subsets_are_not_limited_to_a_word() {

@@ -41,20 +41,12 @@ fn multinomial(d: &[u32]) -> Q {
 }
 
 pub(super) fn integrate(g: u32, n: u32, psi: &[(u32, u32)], lambda: &[(u32, u32)]) -> Q {
-    let threads = std::env::var("SC_FABER_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or_else(|| {
-            if g < 7 {
-                1
-            } else {
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(24)
-            }
-        });
+    let threads = thread_count(g, if lambda.is_empty() { 16 } else { 24 });
     integrate_with_threads(g, n, psi, lambda, threads)
+}
+
+fn thread_count(g: u32, maximum: usize) -> usize {
+    sc_num::parallel::thread_count("SC_FABER_THREADS", if g < 7 { 1 } else { maximum })
 }
 
 fn integrate_with_threads(
@@ -90,6 +82,21 @@ fn integrate_ch_with_threads(
     }
     d.sort_unstable();
 
+    integrate_ch_roots(g, &[(d, Q::ONE)], lambda, explicit_ch, threads)
+}
+
+fn integrate_ch_roots(
+    g: u32,
+    roots: &[(Vec<u32>, Q)],
+    lambda: &[(u32, u32)],
+    explicit_ch: &[(u32, u32)],
+    threads: usize,
+) -> Q {
+    let weight: u64 = lambda
+        .iter()
+        .chain(explicit_ch)
+        .map(|&(l, p)| u64::from(l) * u64::from(p))
+        .sum();
     let factors: Vec<_> = lambda
         .iter()
         .copied()
@@ -115,7 +122,12 @@ fn integrate_ch_with_threads(
         }
         let b = bernoulli(2 * u64::from(g));
         let b = if b < Q::ZERO { -b } else { b };
-        return multinomial(&d) * (Q::ONE - Q::ONE / power) * b / fact(2 * u64::from(g));
+        return roots
+            .iter()
+            .fold(Q::ZERO, |sum, (d, c)| sum + c * multinomial(d))
+            * (Q::ONE - Q::ONE / power)
+            * b
+            / fact(2 * u64::from(g));
     }
     // Hodge 类从 M_g（g≥2）或 M_{1,1} 拉回；超过其维数时为零。
     if weight
@@ -145,18 +157,28 @@ fn integrate_ch_with_threads(
             }
         }
         if threads > 1 {
-            return parallel::integrate(g, &d, &poly, &mut evaluator, threads);
+            return parallel::integrate(g, roots, &poly, &mut evaluator, threads);
         }
         let mut sum = Q::ZERO;
-        for (ch, coefficient) in poly {
-            sum += coefficient * evaluator.eval(g, d.clone(), &ch);
+        for (d, c) in roots {
+            for (ch, coefficient) in &poly {
+                sum += c * coefficient * evaluator.eval(g, d.clone(), ch);
+            }
         }
         sum
     })
 }
 
 pub(super) fn pure(g: u32, d: &[u32]) -> Q {
-    DESCENDENTS.with(|cell| cell.borrow_mut().eval(g, d.to_vec(), &[]))
+    if thread_count(g, 16) == 1 {
+        DESCENDENTS.with(|cell| cell.borrow_mut().eval(g, d.to_vec(), &[]))
+    } else {
+        pure_sum(g, &[(d.to_vec(), Q::ONE)])
+    }
+}
+
+pub(super) fn pure_sum(g: u32, roots: &[(Vec<u32>, Q)]) -> Q {
+    integrate_ch_roots(g, roots, &[], &[], thread_count(g, 16))
 }
 
 /// κ 的逆推前公式：对位置集合分划求和，每块 B 新增 τ_{1+Σ_{i∈B}κ_i}，
@@ -169,8 +191,20 @@ pub(super) fn integrate_mixed(
     lambda: &[(u32, u32)],
     ch: &[(u32, u32)],
 ) -> Q {
+    integrate_mixed_with_threads(g, n, kappa, psi, lambda, ch, thread_count(g, 16))
+}
+
+fn integrate_mixed_with_threads(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+    threads: usize,
+) -> Q {
     if kappa.is_empty() {
-        return integrate_ch_with_threads(g, n, psi, lambda, ch, 1);
+        return integrate_ch_with_threads(g, n, psi, lambda, ch, threads);
     }
     let mut kappalist = Vec::new();
     for &(index, power) in kappa {
@@ -188,22 +222,21 @@ pub(super) fn integrate_mixed(
         };
         *roots.entry(powers).or_insert(Q::ZERO) += coefficient;
     }
-    let mut sum = Q::ZERO;
-    for (powers, coefficient) in roots {
-        if coefficient == Q::ZERO {
-            continue;
-        }
-        let mut descendants = psi.to_vec();
-        descendants.extend(
-            powers
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| (n + i as u32 + 1, p)),
-        );
-        sum += coefficient
-            * integrate_ch_with_threads(g, n + powers.len() as u32, &descendants, lambda, ch, 1);
+    let mut descendants = vec![0; n as usize];
+    for &(leg, power) in psi {
+        descendants[leg as usize - 1] = power;
     }
-    sum
+    let roots: Vec<_> = roots
+        .into_iter()
+        .filter(|(_, c)| *c != Q::ZERO)
+        .map(|(powers, c)| {
+            let mut d = descendants.clone();
+            d.extend(powers);
+            d.sort_unstable();
+            (d, c)
+        })
+        .collect();
+    integrate_ch_roots(g, &roots, lambda, ch, threads)
 }
 
 fn collect_terms(mut terms: Vec<ChMono>) -> Vec<ChMono> {
@@ -687,6 +720,62 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    #[test]
+    fn mixed_and_pure_batches_match_serial_with_fresh_workers() {
+        for g in [3, 5, 7] {
+            for (kappa, lambda, ch) in [
+                (vec![(1, 3)], vec![(1, 3 * g - 8)], vec![(3, 1)]),
+                (vec![(1, 1), (2, 2)], vec![(1, 3 * g - 7)], vec![]),
+                (vec![(1, 2)], vec![], vec![(1, 3 * g - 4)]),
+            ] {
+                let expected = integrate_mixed_with_threads(g, 1, &kappa, &[], &lambda, &ch, 1);
+                for threads in [2, 4] {
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            let value = integrate_mixed_with_threads(
+                                g,
+                                1,
+                                &kappa,
+                                &[],
+                                &lambda,
+                                &ch,
+                                threads,
+                            );
+                            assert_eq!(
+                                value, expected,
+                                "g={g}, κ={kappa:?}, λ={lambda:?}, ch={ch:?}"
+                            );
+                        })
+                        .join()
+                        .unwrap()
+                    });
+                }
+            }
+        }
+        std::thread::spawn(|| {
+            let roots = vec![
+                (vec![2; 12], Q::ONE),
+                (vec![3; 6], Q::from(-2)),
+                (vec![2, 2, 11], Q::from(3)),
+            ];
+            let mut serial = Descendents::default();
+            let expected = roots.iter().fold(Q::ZERO, |sum, (d, c)| {
+                sum + c * serial.eval(5, d.clone(), &[])
+            });
+            // Use an empty serial table so the parallel DAG must actually be constructed.
+            let result = parallel::integrate(
+                5,
+                &roots,
+                &[(vec![], Q::ONE)],
+                &mut Descendents::default(),
+                4,
+            );
+            assert_eq!(result, expected);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

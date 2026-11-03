@@ -17,4 +17,5 @@ pub mod gwl;
 pub mod gwloop;
 pub mod gwpoint;
 pub mod pf;
+mod precompute;
 pub mod qseries;

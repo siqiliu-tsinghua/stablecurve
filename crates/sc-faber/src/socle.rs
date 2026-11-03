@@ -459,18 +459,28 @@ pub fn socle_formula(g: u32, psilist: &[u32], kappalist: &[u32]) -> Result<Q, St
     if g == 0 {
         return Ok(ct_const(0) * ct_sum(psilist, kappalist));
     }
-    let mut total = Q::ZERO;
+    if kappalist.is_empty() {
+        return Ok(crate::hodge::psi_integral(g, psilist));
+    }
+    let mut roots = std::collections::BTreeMap::<Vec<u32>, Q>::new();
     for (blocks, multiplicity) in setparts_with_auts(kappalist) {
         let mut arg = psilist.to_vec();
         arg.extend(blocks.iter().map(|b| 1 + b.iter().sum::<u32>()));
-        let value = multiplicity * crate::hodge::psi_integral(g, &arg);
+        arg.sort_unstable();
+        let coefficient = roots.entry(arg).or_insert(Q::ZERO);
         if (kappalist.len() - blocks.len()) % 2 == 0 {
-            total += value;
+            *coefficient += multiplicity;
         } else {
-            total -= value;
+            *coefficient -= multiplicity;
         }
     }
-    Ok(total)
+    Ok(crate::hodge::psi_sum(
+        g,
+        &roots
+            .into_iter()
+            .filter(|(_, c)| *c != Q::ZERO)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 #[cfg(test)]

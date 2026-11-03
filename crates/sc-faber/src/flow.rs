@@ -18,6 +18,35 @@
 
 use sc_num::{One, Q, Zero, is_zero};
 
+/// 跨图、跨线程复用只读公式表。每个键只由一个线程构造，等待只发生在
+/// 同一张表首次构造时；构造期间不持有表目录的锁，允许递推请求低阶表。
+pub(crate) struct SharedTable<K, V> {
+    entries: std::sync::RwLock<
+        std::collections::BTreeMap<K, std::sync::Arc<std::sync::OnceLock<std::sync::Arc<V>>>>,
+    >,
+}
+
+impl<K: Ord, V> SharedTable<K, V> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub(crate) fn get(&self, key: K, build: impl FnOnce() -> V) -> std::sync::Arc<V> {
+        let found = self.entries.read().unwrap().get(&key).cloned();
+        let entry = found.unwrap_or_else(|| {
+            self.entries
+                .write()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .clone()
+        });
+        entry.get_or_init(|| std::sync::Arc::new(build())).clone()
+    }
+}
+
 /// Σ_{平衡 w} Π_e table[e][w_e]。`edges[e] = (起点, 终点)`，顶点号 < `given.len()`，
 /// 图须连通；`table[e].len() == m`。
 pub(crate) struct FlowTopology {
@@ -198,6 +227,27 @@ impl ZeroInterpolator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_formulas_build_once_and_can_request_lower_orders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tables = SharedTable::<u32, Q>::new();
+        let builds = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let value = tables.get(2, || {
+                        builds.fetch_add(1, Ordering::Relaxed);
+                        tables.get(1, || Q::from(7)).as_ref() * Q::from(6)
+                    });
+                    assert_eq!(*value, Q::from(42));
+                });
+            }
+        });
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn equally_spaced_interpolation_recovers_constant_term() {

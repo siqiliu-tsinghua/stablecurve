@@ -17,6 +17,7 @@ pub mod dr;
 mod flow;
 pub mod generators;
 pub mod graph;
+mod graph_sum;
 pub mod grr;
 pub mod hodge;
 pub mod int;

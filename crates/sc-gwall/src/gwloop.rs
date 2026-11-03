@@ -13,7 +13,7 @@
 //! permute 枚举顺序且作者自注仅 m<9 有效——弃用，见 comb::parity）。
 
 use crate::comb::{parity, permute};
-use crate::gwpoint::{gwpoint, partition_weights, tau_factor};
+use crate::gwpoint::gwpoint;
 use sc_num::{One, Q, Zero};
 
 /// 环路插入 τ_k(a_idx) / τ_k(b_idx)（idx ∈ 1..=g）。
@@ -132,36 +132,56 @@ pub fn fast_gwloop(g: u32, d: u32, tau_point: &[u32], ta: &[LoopIns], tb: &[Loop
         s = e;
     }
     let sign = perm_sign(&rows) * perm_sign(&cols);
-    let entry = |part: &[u32], i: usize, j: usize| -> Q {
-        let (x, y) = (ta[i].tau, tb[j].tau);
-        if x + y == 0 {
-            Q::ZERO // 后代数 −1：负指标 → 零
-        } else {
-            binom(x + y, x) * tau_factor(part, x + y - 1)
-        }
-    };
-    let mut answer = Q::ZERO;
-    'part: for (w, part) in partition_weights(g, d).iter() {
+    let matrix: Vec<Vec<_>> = ta
+        .iter()
+        .map(|a| {
+            tb.iter()
+                .map(|b| {
+                    if a.idx != b.idx {
+                        return None;
+                    }
+                    let sum = a.tau + b.tau;
+                    (sum > 0).then(|| (sum as usize - 1, binom(sum, a.tau)))
+                })
+                .collect()
+        })
+        .collect();
+    let max_tau = matrix
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|(k, _)| *k as u32)
+        .chain(tau_point.iter().copied())
+        .max()
+        .unwrap_or(0);
+    let table = crate::precompute::prepare(g, d, max_tau);
+    let operations = tau_point.len() + blocks.iter().map(|&(s, e)| (e - s).pow(3)).sum::<usize>();
+    let answer = table.sum(operations, |w, factors| {
+        let entry = |i: usize, j: usize| -> Q {
+            matrix[i][j]
+                .as_ref()
+                .map_or(Q::ZERO, |(k, coefficient)| coefficient * &factors[*k])
+        };
         let mut prod = w.clone();
         for &k in tau_point {
-            prod *= tau_factor(part, k);
+            prod *= &factors[k as usize];
         }
         for &(s, e) in &blocks {
             let dv = if e - s == 1 {
-                entry(part, rows[s], cols[s])
+                entry(rows[s], cols[s])
             } else {
                 det(rows[s..e]
                     .iter()
-                    .map(|&i| cols[s..e].iter().map(|&j| entry(part, i, j)).collect())
+                    .map(|&i| cols[s..e].iter().map(|&j| entry(i, j)).collect())
                     .collect())
             };
             if dv == Q::ZERO {
-                continue 'part;
+                return Q::ZERO;
             }
             prod *= dv;
         }
-        answer += prod;
-    }
+        prod
+    });
     answer * Q::from(sign) * q_pow_neg1(m as i64 * (m as i64 - 1) / 2)
 }
 
