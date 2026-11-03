@@ -15,7 +15,7 @@ use crate::num::{One, Q, Zero, q, q_frac};
 use crate::ctx::Ctx;
 
 /// 度 0 不变量：映射到点的公理。对应原版 `mapping_to_point`。
-fn mapping_to_point(iv: &Inv) -> Option<Q> {
+pub(crate) fn mapping_to_point(iv: &Inv) -> Option<Q> {
     if iv.genus == 0 {
         // 亏格 0：多项式系数 × 普通交积
         let mut result = Q::from(iv.deg as i64); // 顶部 H 幂给因子 E

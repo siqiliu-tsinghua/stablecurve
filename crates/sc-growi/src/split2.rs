@@ -157,7 +157,7 @@ pub(crate) fn split2_sum(
     fw: usize,
     mut skip: i32,
 ) -> Option<Q> {
-    let mut result = Q::ZERO;
+    let mut result = crate::parallel::Sum::new(ctx);
     let mut coeff = Q::ONE / Q::from(iv.deg as i64); // 对角类因子 1/E
     let d = iv.cdeg;
 
@@ -251,28 +251,11 @@ pub(crate) fn split2_sum(
             // 先算小侧（亏格低优先，其次度低），为零即跳过另一侧
             let v_first =
                 iv.genus == 0 || iv.genus < iw.genus || (iv.genus == iw.genus && av.cdeg < aw.cdeg);
-            let (tmpv, tmpw) = if v_first {
-                let tv = ctx.compute(&av)?;
-                if tv == Q::ZERO {
-                    continue;
-                }
-                let tw = ctx.compute(&aw)?;
-                if tw == Q::ZERO {
-                    continue;
-                }
-                (tv, tw)
+            if v_first {
+                result.pair(ctx, &coeff, av, aw)?;
             } else {
-                let tw = ctx.compute(&aw)?;
-                if tw == Q::ZERO {
-                    continue;
-                }
-                let tv = ctx.compute(&av)?;
-                if tv == Q::ZERO {
-                    continue;
-                }
-                (tv, tw)
-            };
-            result += &(&coeff * &tmpv) * &tmpw;
+                result.pair(ctx, &coeff, aw, av)?;
+            }
         }
 
         if !sp.next(&mut dw, &mut coeff) {
@@ -280,7 +263,7 @@ pub(crate) fn split2_sum(
         }
     }
 
-    Some(result)
+    result.finish(ctx)
 }
 
 /// 两点、至多一个 descendant 的不变量（WDVV）。原版 `twopoint_onedesc`。

@@ -56,7 +56,7 @@ fn virasoro_b(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
     iw.cdeg = d as i16;
     let n = iw.pts.len();
 
-    let mut result = Q::ZERO;
+    let mut result = crate::parallel::Sum::new(ctx);
     let mut cnt: i64 = 1;
     for j in 0..n {
         if j < n - 1 && iw.pts[j] == iw.pts[j + 1] {
@@ -79,20 +79,19 @@ fn virasoro_b(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
                     k,
                     i,
                 );
-                let mut term = &r * &Q::from(cnt) * &sf;
+                let term = &r * &Q::from(cnt) * &sf;
                 if crate::num::is_zero(&term) {
                     continue;
                 }
                 vdbg(|| format!("B need term {term}*{iw}"));
-                term *= ctx.compute(&iw)?;
-                result += term;
+                result.single(ctx, &term, &iw)?;
             }
         }
         iw.pts[j].h = a;
         iw.pts[j].psi = m;
         cnt = 1;
     }
-    Some(result)
+    result.finish(ctx)
 }
 
 /// C 项： genus−1、前插两点（利用两点对称去重）。
@@ -104,7 +103,7 @@ fn virasoro_c(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
     let mut iw = Inv::new(iv.dim, iv.deg, iv.genus - 1, d as i16, iw_pts);
 
     let mut r = Q::ONE;
-    let mut result = Q::ZERO;
+    let mut result = crate::parallel::Sum::new(ctx);
     for i in 0..=(k + 1).min(iv.dim as i32) {
         for m in idiv(i - k - 1, 2)..=-1 {
             for a in i..=iv.dim as i32 {
@@ -130,13 +129,12 @@ fn virasoro_c(ctx: &mut Ctx, iv: &Inv, k: i32, d: i32) -> Option<Q> {
                     continue;
                 }
                 vdbg(|| format!("B need term {term}*{iw}"));
-                term *= ctx.compute(&iw)?;
-                result += term;
+                result.single(ctx, &term, &iw)?;
             }
         }
         r *= Q::from((iv.dim as i32 + 2 - iv.deg as i32) as i64);
     }
-    Some(result)
+    result.finish(ctx)
 }
 
 /// D 项：亏格分裂 h ⊔ g−h，经 trr_variable（首类分裂保留变量）。
@@ -152,6 +150,7 @@ fn virasoro_d(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
     let w_hdr = Inv::new(iv.dim, iv.deg, 0, 0, [Pdata::default()]);
 
     let mut result = Q::ZERO;
+    let mut numbers = crate::parallel::Sum::new(ctx);
     let mut coeff = Q::ONE / Q::from(deg as i64);
     let mut ddw: i32 = dim - 3;
     let mut skip = true;
@@ -208,24 +207,16 @@ fn virasoro_d(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
                         vdbg(|| format!("D need term {fact}*{coeff}*{av}*{aw}"));
 
                         // 原版先算 w 侧
-                        let mut tmpw = ctx.compute(&aw)?;
-                        if crate::num::is_zero(&tmpw) {
-                            continue;
-                        }
-                        tmpw *= &(&fact * &coeff);
-
                         if skip {
-                            // 全亏格 + 全部标记点：走 trr_variable（留变量）
-                            let tmpv = trr_variable(ctx, sys, &av, &tmpw)?;
-                            result += tmpv;
-                            continue;
+                            let mut tmpw = ctx.compute(&aw)?;
+                            if crate::num::is_zero(&tmpw) {
+                                continue;
+                            }
+                            tmpw *= &(&fact * &coeff);
+                            result += trr_variable(ctx, sys, &av, &tmpw)?;
+                        } else {
+                            numbers.pair(ctx, &(&fact * &coeff), aw, av)?;
                         }
-
-                        let tmpv = ctx.compute(&av)?;
-                        if crate::num::is_zero(&tmpv) {
-                            continue;
-                        }
-                        result += &tmpv * &tmpw;
                     }
                 }
                 r *= Q::from(dm as i64);
@@ -237,7 +228,7 @@ fn virasoro_d(ctx: &mut Ctx, sys: &mut Linsys, iv: &Inv, k: i32, d: i32) -> Opti
         }
     }
 
-    Some(result)
+    Some(result + numbers.finish(ctx)?)
 }
 
 /// 组装一条 L_k 方程并提交。各项算不出 → 不定（原版 UNDETERMINED）。

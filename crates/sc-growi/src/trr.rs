@@ -63,7 +63,7 @@ fn trr_reduce(ctx: &mut Ctx, iv: &Inv) -> Option<Q> {
     let v_hdr = Inv::new(iv.dim, iv.deg, 0, iv.cdeg, v_pts);
     let w_hdr = Inv::new(iv.dim, iv.deg, iv.genus, 0, [Pdata::default()]);
 
-    let mut result = Q::ZERO;
+    let mut result = crate::parallel::Sum::new(ctx);
     let mut coeff = Q::ONE / Q::from(iv.deg as i64); // 对角类因子 1/E
     let mut dw: i32 = (dim - 3) * (1 - g);
 
@@ -99,15 +99,7 @@ fn trr_reduce(ctx: &mut Ctx, iv: &Inv) -> Option<Q> {
                 if crate::env_flag("SC_GROWI_VIRASORO") {
                     eprintln!("[trr-red] need term {coeff}*{av}*{aw}");
                 }
-                let tmpv = ctx.compute(&av)?;
-                if tmpv == Q::ZERO {
-                    continue;
-                }
-                let tmpw = ctx.compute(&aw)?;
-                if tmpw == Q::ZERO {
-                    continue;
-                }
-                result += &(&coeff * &tmpv) * &tmpw;
+                result.pair(ctx, &coeff, av, aw)?;
             }
         }
         if !sp.next(&mut dw, &mut coeff) {
@@ -115,7 +107,7 @@ fn trr_reduce(ctx: &mut Ctx, iv: &Inv) -> Option<Q> {
         }
     }
 
-    Some(result)
+    result.finish(ctx)
 }
 
 /// trr_reduce 的"变量版"——原版 `trr_variable`（供 Virasoro 使用）。
@@ -160,7 +152,7 @@ pub(crate) fn trr_variable(
     let v_hdr = Inv::new(iv.dim, iv.deg, 0, iv.cdeg, v_pts);
     let w_hdr = Inv::new(iv.dim, iv.deg, iv.genus, 0, [Pdata::default()]);
 
-    let mut result = Q::ZERO;
+    let mut result = crate::parallel::Sum::new(ctx);
     let mut coeff = Q::ONE / Q::from(deg as i64);
     let mut dw: i32 = (dim - 3) * (1 - g);
     let mut sp = PairSplit::new(&v_hdr, &w_hdr, 2, 1);
@@ -193,35 +185,11 @@ pub(crate) fn trr_variable(
                 if crate::env_flag("SC_GROWI_VIRASORO") {
                     eprintln!("[trr-var] need term {coeff}*{av}*{aw}");
                 }
-                let tmpv = ctx.compute(&av)?;
-                if tmpv == Q::ZERO {
-                    continue;
-                }
-
                 if av.pts.len() != 2 {
-                    let tmpw = ctx.compute(&aw)?;
-                    if tmpw == Q::ZERO {
-                        continue;
-                    }
-                    result += &(&coeff * &tmpv) * &tmpw;
+                    result.pair(ctx, &coeff, av, aw)?;
                 } else {
-                    // 2 点特例：w 侧只用 simplify（勿排序原骨架）
-                    let mut probe2 = aw.clone();
-                    let tmpw = crate::simplify::simplify(ctx, &mut probe2);
-                    match tmpw {
-                        Some(v) if v != Q::ZERO => {
-                            result += &(&coeff * &tmpv) * &v;
-                        }
-                        Some(_) => {} // 零：跳过
-                        None => {
-                            // 留作变量（名字取自未排序的 aw）
-                            let name = aw.cdeg as i32 * (dim + 1) + aw.pts[0].h as i32;
-                            if !sys.add_var_term(name, -&(cof * &coeff * &tmpv)) {
-                                eprintln!("*trr* too many variables!");
-                                return None;
-                            }
-                        }
-                    }
+                    let name = aw.cdeg as i32 * (dim + 1) + aw.pts[0].h as i32;
+                    result.conditional_pair(ctx, &coeff, av, aw, name)?;
                 }
             }
         }
@@ -230,7 +198,7 @@ pub(crate) fn trr_variable(
         }
     }
 
-    Some(cof * result)
+    result.finish_linear(ctx, sys, cof)
 }
 
 /// 任意亏格 TRR 入口。原版 `trr_genusg`。

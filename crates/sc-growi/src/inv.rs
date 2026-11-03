@@ -80,7 +80,7 @@ impl fmt::Display for Pdata {
 }
 
 /// 一个（绝对或相对的）Gromov-Witten 不变量。
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Inv {
     pub dim: i16,   // 流形维数（原版 xdim）
     pub deg: i16,   // 流形次数（原版 xdeg）

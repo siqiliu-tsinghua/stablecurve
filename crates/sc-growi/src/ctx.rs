@@ -14,11 +14,22 @@ pub struct Ctx {
     pub cache: Cache,
     /// 递归深度保护（调试用；正常计算远达不到）
     depth: u32,
+    pub(crate) threads: usize,
+    worker: bool,
+    #[cfg(test)]
+    pub(crate) parallel_profile: (usize, usize, std::time::Duration),
 }
 
 impl Ctx {
     pub fn new(cache: Cache) -> Self {
-        Ctx { cache, depth: 0 }
+        Ctx {
+            cache,
+            depth: 0,
+            threads: sc_num::parallel::thread_count("SC_GROWI_THREADS", 16),
+            worker: false,
+            #[cfg(test)]
+            parallel_profile: Default::default(),
+        }
     }
 
     pub fn memory() -> Self {
@@ -31,6 +42,21 @@ impl Ctx {
 
     pub(crate) fn depth(&self) -> u32 {
         self.depth
+    }
+
+    pub(crate) fn worker(cache: Cache, depth: u32) -> Self {
+        Self {
+            cache,
+            depth,
+            threads: 1,
+            worker: true,
+            #[cfg(test)]
+            parallel_profile: Default::default(),
+        }
+    }
+
+    pub(crate) fn parallelism(&self) -> usize {
+        self.threads
     }
 
     pub fn flush(&mut self) {
@@ -74,7 +100,9 @@ impl Ctx {
         if let Some(r) = crate::relsplit::relsplit(self, iv) {
             return Some(r);
         }
-        eprintln!("*error* don't know how to compute {iv}");
+        if !self.worker {
+            eprintln!("*error* don't know how to compute {iv}");
+        }
         None
     }
 }

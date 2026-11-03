@@ -15,6 +15,7 @@ use crate::relinv::RelInv;
 /// 相对亏格 0 不变量。最后一点必须是相对点。`skip0`：跳过开头的修正项数。
 fn rs_genus0_rel(ctx: &mut Ctx, iv: &mut Inv, mut skip0: i32) -> Option<Q> {
     let mut result = Q::ZERO;
+    let mut corrections = crate::parallel::Sum::new(ctx);
     let j = iv.pts.len() - 1;
     let ivdeg = iv.deg as i64;
     let ivdim = iv.dim;
@@ -41,29 +42,20 @@ fn rs_genus0_rel(ctx: &mut Ctx, iv: &mut Inv, mut skip0: i32) -> Option<Q> {
             // 内部分量（绝对不变量）
             let mut iw = rv.cpt(0);
             iw.delmult();
-            let mut term = ctx.compute(&iw)?;
+            let term = ctx.compute(&iw)?;
             if term != Q::ZERO {
-                // 外部分量从后往前（最容易为零，可提前剪枝）
-                for i in (1..=rv.cpts() as i32).rev() {
-                    let iw = rv.cpt(i);
-                    term = &term * &ctx.compute(&iw)?;
-                    if term == Q::ZERO {
-                        break;
-                    }
-                }
-                if term != Q::ZERO {
-                    let contrib = &(rv.cof() * &term);
-                    if crate::env_flag("SC_GROWI_REL") && ctx.depth() <= 8 {
-                        eprintln!("    CONTRIB -{contrib}");
-                    }
-                    result -= contrib;
-                }
+                corrections.product(
+                    ctx,
+                    rv.cof() * term,
+                    (1..=rv.cpts() as i32).rev().map(|i| rv.cpt(i)),
+                )?;
             }
         }
         if !rv.next() {
             break;
         }
     }
+    result -= corrections.finish(ctx)?;
 
     // 重数降到 0 且前一点也无重数 → 换到环境 P^(n+1)（E=1）
     if iv.pts[j].mult == 0 && (j == 0 || iv.pts[j - 1].mult == 0) {

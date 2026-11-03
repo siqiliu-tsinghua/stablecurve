@@ -5,6 +5,10 @@
 //!
 //! 本 crate 只包含纯 Rust 的算法核心；CLI 与 pyo3 绑定是后续独立的 `sc-*` crate。
 //!
+//! 单查询的分裂求和与 TRR 系数计算默认最多使用 16 个线程（不超过可用处理器数）。
+//! 创建 [`Ctx`] 前可用 `SC_GROWI_THREADS` 指定上限；设为 `1` 使用串行路径。
+//! 工作线程共享已完成的精确值；Virasoro 变量归并与增量消元按原顺序执行。
+//!
 //! 模块布局（对应原版文件，见 REDESIGN §2.3 映射表）：
 //! - [`num`]     —— 有理数后端（malachite），对应 `math/rational.cc`
 //! - [`poly`]    —— 变量/单项式/多项式，平坦 `Vec` 实现，对应 `math/{var,monomial,poly}.cc`
@@ -39,6 +43,7 @@ pub mod intern;
 pub mod inv;
 pub mod linsys;
 pub mod num;
+mod parallel;
 pub mod poly;
 pub mod query;
 pub mod relinv;

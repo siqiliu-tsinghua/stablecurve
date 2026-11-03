@@ -7,8 +7,10 @@
 //! 键 = 规范形 [`Inv`] 的版本化变长整数编码（LEB128/zigzag），不再用原版的
 //! 私有位打包。值 = 分子/分母的十进制字符串（精确、跨平台）。
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
 use rusqlite::Connection;
 
@@ -27,6 +29,40 @@ pub struct Cache {
     l1: HashMap<Inv, Q>,
     dirty: Vec<(Inv, Q)>,
     db: Option<Db>,
+    shared: Option<Arc<SharedCache>>,
+}
+
+/// 分裂求和期间复用调用方已有结果，并发布本批次新算出的完整值。
+/// 不登记或等待尚在计算的递归状态，因此不会形成跨线程递归等待环。
+pub(crate) struct SharedCache {
+    base: HashMap<Inv, Q>,
+    completed: RwLock<BTreeMap<Inv, (Q, bool)>>,
+    db: Option<Mutex<Db>>,
+}
+
+impl SharedCache {
+    fn get(&self, inv: &Inv) -> Option<Q> {
+        if let Some((value, _)) = self.completed.read().unwrap().get(inv) {
+            return Some(value.clone());
+        }
+        let value = self.db.as_ref()?.lock().unwrap().lookup(&encode_key(inv))?;
+        self.completed
+            .write()
+            .unwrap()
+            .entry(inv.clone())
+            .or_insert_with(|| (value.clone(), false));
+        Some(value)
+    }
+
+    fn put(&self, inv: &Inv, value: &Q) {
+        if !self.base.contains_key(inv) {
+            self.completed
+                .write()
+                .unwrap()
+                .entry(inv.clone())
+                .or_insert_with(|| (value.clone(), true));
+        }
+    }
 }
 
 struct Db {
@@ -40,6 +76,7 @@ impl Cache {
             l1: HashMap::new(),
             dirty: Vec::new(),
             db: None,
+            shared: None,
         }
     }
 
@@ -52,6 +89,16 @@ impl Cache {
 
     /// 读穿查询：L1 → L2 →（都没有）None。L2 命中时提升进 L1。
     pub fn get(&mut self, inv: &Inv) -> Option<Q> {
+        if let Some(shared) = &self.shared {
+            // 批次开始前的结果可直接无锁读取，无需复制键值到每个工作线程。
+            // 仅本批次新增结果保留局部副本，避免重复获取 completed 的读锁。
+            if let Some(value) = shared.base.get(inv).or_else(|| self.l1.get(inv)) {
+                return Some(value.clone());
+            }
+            let value = shared.get(inv)?;
+            self.l1.insert(inv.clone(), value.clone());
+            return Some(value);
+        }
         if let Some(v) = self.l1.get(inv) {
             return Some(v.clone());
         }
@@ -66,6 +113,9 @@ impl Cache {
     pub fn put(&mut self, inv: Inv, value: Q) {
         if crate::env_flag("SC_GROWI_KEYS") {
             eprintln!("[key] {inv} = {value}");
+        }
+        if let Some(shared) = &self.shared {
+            shared.put(&inv, &value);
         }
         if self.db.is_none() {
             self.l1.insert(inv, value);
@@ -105,6 +155,35 @@ impl Cache {
 
     pub fn is_empty(&self) -> bool {
         self.l1.is_empty()
+    }
+
+    pub(crate) fn start_parallel(&mut self) -> Arc<SharedCache> {
+        assert!(self.shared.is_none());
+        Arc::new(SharedCache {
+            base: std::mem::take(&mut self.l1),
+            completed: RwLock::new(BTreeMap::new()),
+            db: self.db.take().map(Mutex::new),
+        })
+    }
+
+    pub(crate) fn worker(shared: Arc<SharedCache>) -> Self {
+        let mut cache = Self::memory();
+        cache.shared = Some(shared);
+        cache
+    }
+
+    pub(crate) fn finish_parallel(&mut self, shared: Arc<SharedCache>) {
+        let shared =
+            Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("parallel cache still borrowed"));
+        self.l1 = shared.base;
+        self.db = shared.db.map(|db| db.into_inner().unwrap());
+        for (inv, (value, fresh)) in shared.completed.into_inner().unwrap() {
+            if fresh {
+                self.put(inv, value);
+            } else {
+                self.l1.insert(inv, value);
+            }
+        }
     }
 }
 
@@ -260,6 +339,62 @@ mod tests {
         assert_eq!(c.get(&lines_p2()), Some(Q::from(1)));
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_reads_and_new_values_survive_sqlite_reopening() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("sc-growi-parallel-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("cache.sqlite");
+        let values = [1, 12, 620, 87304];
+        let invariant = |i: usize| {
+            Inv::new(
+                2,
+                1,
+                0,
+                i as i16 + 2,
+                vec![Pdata::new(2, 0, 0); 3 * (i + 2) - 1],
+            )
+        };
+        {
+            let mut cache = Cache::with_db(&path).unwrap();
+            cache.put(lines_p2(), Q::from(1));
+            cache.flush();
+        }
+        {
+            let mut cache = Cache::with_db(&path).unwrap();
+            let shared = cache.start_parallel();
+            sc_num::parallel::chunks(
+                4,
+                1,
+                4,
+                || Cache::worker(shared.clone()),
+                |worker, range| {
+                    assert_eq!(worker.get(&lines_p2()), Some(Q::from(1)));
+                    for i in range {
+                        worker.put(invariant(i), Q::from(values[i]));
+                    }
+                },
+            );
+            cache.finish_parallel(shared);
+            assert!(cache.db.is_some());
+            assert_eq!(cache.dirty.len(), 4);
+            assert_eq!(cache.len(), 5);
+            cache.flush();
+        }
+        {
+            let mut cache = Cache::with_db(&path).unwrap();
+            for (i, value) in values.into_iter().enumerate() {
+                assert_eq!(cache.get(&invariant(i)), Some(Q::from(value)));
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
