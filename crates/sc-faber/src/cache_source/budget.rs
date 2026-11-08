@@ -285,6 +285,8 @@ struct SampleCutoff {
 struct State {
     config: BudgetConfig,
     snapshot: MemorySnapshot,
+    #[cfg(test)]
+    test_sample_age: Option<Duration>,
     last_private: Option<u64>,
     last_limits: Option<Limits>,
     pressure: Pressure,
@@ -325,6 +327,8 @@ impl Budget {
                 config,
                 last_private: snapshot.process_private_bytes,
                 snapshot,
+                #[cfg(test)]
+                test_sample_age: None,
                 last_limits: None,
                 pressure: Pressure::Normal,
                 reservations: BTreeMap::new(),
@@ -420,14 +424,21 @@ impl Budget {
             state.last_private = Some(private);
         }
         state.snapshot = snapshot;
+        state.test_sample_age = None;
         // An externally captured sample has no proven capture-start cutoff.
         // Retaining liabilities is conservative; only refresh can retire them.
+    }
+
+    /// Synthetic age keeps tests independent of the platform clock's lower bound.
+    #[cfg(test)]
+    pub(crate) fn set_sample_age_for_test(&self, age: Duration) {
+        self.state.lock().unwrap().test_sample_age = Some(age);
     }
 
     fn refresh(&self, force: bool) {
         if !force {
             let state = self.state.lock().unwrap();
-            if state.snapshot.captured_at.elapsed() < state.config.sample_interval {
+            if state.sample_age() < state.config.sample_interval {
                 return;
             }
         }
@@ -447,7 +458,7 @@ impl Budget {
         let _sampling = Sampling(&self.sampling);
         if !force {
             let state = self.state.lock().unwrap();
-            if state.snapshot.captured_at.elapsed() < state.config.sample_interval {
+            if state.sample_age() < state.config.sample_interval {
                 return;
             }
         }
@@ -687,6 +698,14 @@ impl Drop for ReservationGroup {
 }
 
 impl State {
+    fn sample_age(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(age) = self.test_sample_age {
+            return age;
+        }
+        self.snapshot.captured_at.elapsed()
+    }
+
     fn begin_sample(&mut self) -> SampleCutoff {
         self.next_generation = self
             .next_generation
@@ -718,6 +737,10 @@ impl State {
         }
         self.sample_generation = cutoff.generation;
         self.snapshot = snapshot;
+        #[cfg(test)]
+        {
+            self.test_sample_age = None;
+        }
     }
 
     fn settle_entry(&mut self, id: u64, bytes: u64) -> Result<(), ReservationError> {
@@ -802,7 +825,7 @@ impl State {
     }
 
     fn decision(&mut self, additional: u64) -> BudgetDecision {
-        let age = self.snapshot.captured_at.elapsed();
+        let age = self.sample_age();
         let stale = age
             > self
                 .config
@@ -1751,11 +1774,9 @@ mod tests {
         ));
         progress.cancel_unused().unwrap();
         group.cancel_unused().unwrap();
-        let mut old = sample(100, 10_000);
-        old.captured_at = Instant::now()
-            .checked_sub(Duration::from_secs(121))
-            .unwrap();
-        budget.publish_snapshot(old);
+        budget.publish_snapshot(sample(100, 10_000));
+        budget.set_sample_age_for_test(Duration::from_secs(121));
+        assert_eq!(budget.check(0).sample_age, Duration::from_secs(121));
         assert!(budget.check(0).stale);
         assert_ne!(budget.check(0).pressure, Pressure::Normal);
         assert!(matches!(
@@ -1768,6 +1789,7 @@ mod tests {
         ));
         let cutoff = budget.state.lock().unwrap().begin_sample();
         publish_cutoff(&budget, sample(100, 10_000), cutoff);
+        assert!(!budget.check(0).stale);
         budget
             .try_reserve(1, ReservationKind::Compute)
             .unwrap()
@@ -1791,11 +1813,9 @@ mod tests {
         let future = budget.try_reserve(100, ReservationKind::Compute).unwrap();
         future.ensure(400).unwrap();
         assert_eq!(budget.check(0).active_reserved_bytes, 400);
-        let mut old = sample(100, 10_000);
-        old.captured_at = Instant::now()
-            .checked_sub(Duration::from_secs(121))
-            .unwrap();
-        budget.publish_snapshot(old);
+        budget.publish_snapshot(sample(100, 10_000));
+        budget.set_sample_age_for_test(Duration::from_secs(121));
+        assert!(budget.check(0).stale);
         // Shrinking proved-unused memory does not compete for fresh admission.
         future.shrink_unstarted(100).unwrap();
         assert_eq!(future.reserved_bytes(), 100);

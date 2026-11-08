@@ -83,6 +83,8 @@ pub(super) struct WorkManager {
     transaction_open: bool,
     transaction_bytes: u64,
     transaction_first: Option<Instant>,
+    #[cfg(test)]
+    transaction_age_override: Option<Duration>,
 }
 
 struct WorkEntry {
@@ -161,6 +163,8 @@ impl WorkManager {
             transaction_open: false,
             transaction_bytes: 0,
             transaction_first: None,
+            #[cfg(test)]
+            transaction_age_override: None,
         }
     }
 
@@ -228,7 +232,7 @@ impl WorkManager {
             // commit an unfinished batch merely to delete its file afterwards.
             self.transaction_open = false;
             self.transaction_bytes = 0;
-            self.transaction_first = None;
+            self.set_transaction_first(None);
             self.scratch.take();
         } else {
             self.database = Some(database);
@@ -305,6 +309,10 @@ impl WorkManager {
             // owner must stop; never retry SQL on this connection after failure.
             self.fail(error);
             self.initialization_error = Some(error.clone());
+            #[cfg(test)]
+            {
+                self.transaction_age_override = None;
+            }
         }
         result
     }
@@ -457,7 +465,7 @@ impl WorkManager {
             self.transaction_open = true;
             // Batch timing is opt-in; the original per-block path does not
             // acquire an additional clock reading for this policy.
-            self.transaction_first = (policy.bytes != 0).then(Instant::now);
+            self.set_transaction_first((policy.bytes != 0).then(Instant::now));
         }
         let started = detailed.then(Instant::now);
         let deleted = connection
@@ -531,9 +539,7 @@ impl WorkManager {
             .batch_policy
             .expect("open workspace transaction has a policy");
         if self.transaction_bytes >= policy.bytes
-            || self
-                .transaction_first
-                .is_some_and(|first| first.elapsed() >= policy.age)
+            || self.transaction_age().is_some_and(|age| age >= policy.age)
         {
             self.commit_work(connection)?;
             return Ok(true);
@@ -548,9 +554,26 @@ impl WorkManager {
         committed?;
         self.transaction_open = false;
         self.transaction_bytes = 0;
-        self.transaction_first = None;
+        self.set_transaction_first(None);
         self.report.commits += 1;
         Ok(())
+    }
+
+    fn set_transaction_first(&mut self, first: Option<Instant>) {
+        self.transaction_first = first;
+        #[cfg(test)]
+        {
+            self.transaction_age_override = None;
+        }
+    }
+
+    fn transaction_age(&self) -> Option<Duration> {
+        let first = self.transaction_first?;
+        #[cfg(test)]
+        if let Some(age) = self.transaction_age_override {
+            return Some(age);
+        }
+        Some(first.elapsed())
     }
 
     fn diagnostic_timing(&mut self) -> bool {
@@ -1584,8 +1607,13 @@ mod tests {
         assert_eq!(source.state.lock().unwrap().restored, source.payload.0);
         assert_eq!(manager.report().commits, 0);
         assert!(!connection.is_autocommit());
-        manager.batch_policy = Some(workspace_batch_policy(Some("1m")).unwrap());
-        manager.transaction_first = Some(Instant::now() - Duration::from_secs(1));
+        let policy = workspace_batch_policy(Some("1m")).unwrap();
+        assert!(policy.age > Duration::ZERO);
+        manager.batch_policy = Some(policy);
+        manager.transaction_age_override = Some(policy.age - Duration::from_nanos(1));
+        assert!(!manager.commit_due(connection).unwrap());
+        assert!(!connection.is_autocommit());
+        manager.transaction_age_override = Some(policy.age);
         // No reads, writes or pressure requests: an idle turn still commits.
         assert!(
             manager
@@ -1594,6 +1622,7 @@ mod tests {
         );
         assert!(connection.is_autocommit());
         assert_eq!(manager.report().commits, 1);
+        assert!(manager.transaction_age_override.is_none());
         assert_eq!(pragma_text(&main, "journal_mode"), "wal");
         assert_eq!(pragma_integer(&main, "synchronous"), 2);
         assert_eq!(pragma_text(connection, "journal_mode"), "off");
@@ -1807,12 +1836,15 @@ mod tests {
         connection
             .execute("INSERT INTO test_child VALUES(404)", [])
             .unwrap();
-        manager.batch_policy = Some(workspace_batch_policy(Some("1m")).unwrap());
-        manager.transaction_first = Some(Instant::now() - Duration::from_secs(1));
+        let policy = workspace_batch_policy(Some("1m")).unwrap();
+        assert!(policy.age > Duration::ZERO);
+        manager.batch_policy = Some(policy);
+        manager.transaction_age_override = Some(policy.age);
         let error = manager
             .step_on_with_pressure(connection, &mut |_| 0)
             .unwrap_err();
         assert!(error.contains("FOREIGN KEY"));
+        assert!(manager.transaction_age_override.is_none());
         assert_eq!(
             source.state.lock().unwrap().error.as_deref(),
             Some(error.as_str())

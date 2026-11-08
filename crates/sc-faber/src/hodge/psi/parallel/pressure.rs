@@ -901,9 +901,10 @@ mod adaptive_capacity_tests {
 
     #[test]
     fn stale_observation_and_size_overflow_do_not_try_smaller_candidates() {
-        let (budget, wave, mut snapshot) = local_wave(192, true);
-        snapshot.captured_at = Instant::now() - Duration::from_secs(300);
-        budget.publish_snapshot(snapshot);
+        let (budget, wave, _) = local_wave(192, true);
+        budget.set_sample_age_for_test(Duration::from_secs(300));
+        assert_eq!(budget.check(0).sample_age, Duration::from_secs(300));
+        assert!(budget.check(0).stale);
         let mut values = data();
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Wave::with(Some(&wave), || capacity(&mut values, 65));
