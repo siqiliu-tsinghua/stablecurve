@@ -27,20 +27,41 @@ fn to_fraction(py: Python<'_>, v: &faber::Q) -> PyObject {
 // 类名即 Python 接口名（沿用原程序名），保留全大写
 #[allow(clippy::upper_case_acronyms)]
 #[pyclass(unsendable)]
-struct FABER;
+struct FABER {
+    session: Option<faber::socle::CacheSession>,
+}
+
+fn with_session<T>(
+    session: Option<&faber::socle::CacheSession>,
+    calculate: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    match session {
+        Some(session) => session.run(calculate),
+        None => faber::socle::CacheSession::run_uncached(calculate),
+    }
+}
 
 #[pymethods]
 impl FABER {
+    /// Set the total-process memory budget shared by cache-backed calculations.
+    /// None selects the automatic budget derived from available system memory.
+    #[staticmethod]
+    #[pyo3(signature = (maximum_bytes=None))]
+    fn set_memory_limit(maximum_bytes: Option<u64>) -> PyResult<()> {
+        faber::socle::set_cache_memory_limit(maximum_bytes).map_err(PyValueError::new_err)
+    }
+
     /// FABER(cache=None)：`cache` 为 SQLite L2 路径；None → ~/.faber/cache.sqlite；
-    /// "" → 不用持久缓存。注意 L2 是进程全局的：新建实例会替换（或卸下）
-    /// 此前实例挂接的缓存。
+    /// "" → 不用持久缓存。每个实例独立持有自己的缓存会话。
     #[new]
     #[pyo3(signature = (cache=None))]
     fn new(cache: Option<&str>) -> PyResult<Self> {
-        match cache {
-            Some("") => faber::socle::detach_cache(),
-            Some(p) => faber::socle::attach_cache(p)
-                .map_err(|e| PyValueError::new_err(format!("无法打开缓存 {p}: {e}")))?,
+        let session = match cache {
+            Some("") => None,
+            Some(p) => Some(
+                faber::socle::CacheSession::open(p)
+                    .map_err(|e| PyValueError::new_err(format!("无法打开缓存 {p}: {e}")))?,
+            ),
             None => {
                 let home = std::env::var_os("HOME")
                     .or_else(|| std::env::var_os("USERPROFILE"))
@@ -49,20 +70,44 @@ impl FABER {
                 std::fs::create_dir_all(&dir).map_err(|e| {
                     PyValueError::new_err(format!("无法创建 {}: {e}", dir.display()))
                 })?;
-                // 缺省缓存打不开时降级为纯内存（cache_attached 反映实际状态）
-                if faber::socle::attach_cache(&dir.join("cache.sqlite").to_string_lossy()).is_err()
-                {
-                    faber::socle::detach_cache();
-                }
+                let path = dir.join("cache.sqlite");
+                Some(
+                    faber::socle::CacheSession::open(&path.to_string_lossy()).map_err(|e| {
+                        PyValueError::new_err(format!("无法打开缓存 {}: {e}", path.display()))
+                    })?,
+                )
             }
-        }
-        Ok(FABER)
+        };
+        Ok(FABER { session })
     }
 
-    /// L2 缓存当前是否挂接（进程全局状态）。
+    /// 当前实例是否有可用的持久缓存。
     #[getter]
     fn cache_attached(&self) -> bool {
-        faber::socle::cache_attached()
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.is_open())
+    }
+
+    #[getter]
+    fn cache_error(&self) -> Option<String> {
+        self.session.as_ref().and_then(|session| session.error())
+    }
+
+    fn flush_cache(&self, py: Python<'_>) -> PyResult<()> {
+        let session = self.session.as_ref();
+        py.allow_threads(|| session.map_or(Ok(()), |session| session.flush()))
+            .map_err(PyValueError::new_err)
+    }
+
+    fn close_cache(&mut self, py: Python<'_>) -> PyResult<()> {
+        let session = self.session.as_ref();
+        py.allow_threads(|| session.map_or(Ok(()), |session| session.close()))
+            .map_err(PyValueError::new_err)?;
+        // A failed close retains its owner and its latched error. Later calls
+        // must not silently change from persistence to pure-memory operation.
+        self.session.take();
+        Ok(())
     }
 
     /// 清空内存中的稳定图缓存（dr 等按 (g, n) 逐层缓存枚举出的稳定图，
@@ -83,7 +128,10 @@ impl FABER {
         lam: Vec<(u32, u32)>,
         ch: Vec<(u32, u32)>,
     ) -> PyResult<PyObject> {
-        let v = py.allow_threads(|| faber::hodge::klp(g, n, &kappa, &psi, &lam, &ch));
+        let session = self.session.as_ref();
+        let v = py.allow_threads(|| {
+            with_session(session, || faber::hodge::klp(g, n, &kappa, &psi, &lam, &ch))
+        });
         match v {
             Ok(v) => Ok(to_fraction(py, &v)),
             Err(e) => Err(PyValueError::new_err(e)),
@@ -101,7 +149,9 @@ impl FABER {
         kappa: Vec<(u32, u32)>,
         psi: Vec<(u32, u32)>,
     ) -> PyResult<PyObject> {
-        let v = py.allow_threads(|| faber::dr::int_dr(g, &a, r, &kappa, &psi));
+        let session = self.session.as_ref();
+        let v = py
+            .allow_threads(|| with_session(session, || faber::dr::int_dr(g, &a, r, &kappa, &psi)));
         match v {
             Ok(v) => Ok(to_fraction(py, &v)),
             Err(e) => Err(PyValueError::new_err(e)),

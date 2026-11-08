@@ -78,8 +78,18 @@ fn with_dr<R>(
     external_psi: Option<&[(u32, u32)]>,
     consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
 ) -> Result<R, String> {
-    let n = dvector.len() as u32;
     let r = dr_degree(g, dvector, r)?;
+    with_dr_prepared(dvector, r, gen_norm, external_psi, consume)
+}
+
+fn with_dr_prepared<R>(
+    dvector: &[i64],
+    r: u32,
+    gen_norm: bool,
+    external_psi: Option<&[(u32, u32)]>,
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    let n = dvector.len() as u32;
     let m0 = (dvector.iter().map(|d| d.abs()).sum::<i64>() + 1) / 2;
     let two_pow = sc_num::pow_unsigned(&Q::from(2), u64::from(r));
     let interpolators: Vec<_> = (0..=r)
@@ -222,12 +232,27 @@ pub fn int_dr(
             .map(|&(i, p)| u128::from(i) * u128::from(p))
             .sum::<u128>()
         + psi.iter().map(|&(_, p)| u128::from(p)).sum::<u128>();
-    if degree > g || weight != (3 * i64::from(g) - 3 + dvector.len() as i64) as u128 {
-        return Ok(Q::ZERO);
-    }
-    with_dr(g, dvector, r, false, Some(psi), |degree, visit| {
-        crate::graph_sum::integrate(g, dvector.len() as u32, degree, kappa, psi, visit)
-    })
+    let zero = degree > g || weight != (3 * i64::from(g) - 3 + dvector.len() as i64) as u128;
+    use crate::hodge::root_source::{named_i64s, named_powers, with_named_policy};
+    with_named_policy(
+        "scalar-dr-v1",
+        || {
+            let mut key = vec![g, degree];
+            named_i64s(&mut key, dvector);
+            named_powers(&mut key, kappa);
+            named_powers(&mut key, psi);
+            key
+        },
+        !zero,
+        || {
+            if zero {
+                return Ok(Q::ZERO);
+            }
+            with_dr_prepared(dvector, degree, false, Some(psi), |degree, visit| {
+                crate::graph_sum::integrate(g, dvector.len() as u32, degree, kappa, psi, visit)
+            })
+        },
+    )
 }
 
 #[cfg(test)]

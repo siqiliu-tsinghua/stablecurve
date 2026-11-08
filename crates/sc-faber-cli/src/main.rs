@@ -144,7 +144,7 @@ fn answer(line: &str) -> Result<String, String> {
 
 const USAGE: &str = "用法：faber --batch [--cache PATH] < queries.jsonl\n      faber '{\"op\":\"klp\",\"g\":2,\"n\":1,\"psi\":[[1,4]]}' [--cache PATH]";
 
-fn main() {
+fn main_run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut batch = false;
     let mut cache: Option<String> = None;
@@ -163,7 +163,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!("{USAGE}");
-                return;
+                return 0;
             }
             s if s.starts_with("--") => {
                 eprintln!("未知选项 {s}\n{USAGE}");
@@ -175,7 +175,8 @@ fn main() {
     }
     if let Some(c) = &cache {
         if let Err(e) = sc_faber::socle::attach_cache(c) {
-            eprintln!("warning: 缓存不可用（{e}），继续无 L2");
+            eprintln!("error: 无法打开缓存 {c}: {e}");
+            return 2;
         }
     }
     if let (false, Some(line)) = (batch, &single) {
@@ -183,10 +184,10 @@ fn main() {
             Ok(v) => println!("{v}"),
             Err(e) => {
                 eprintln!("error: {e}");
-                std::process::exit(2);
+                return 2;
             }
         }
-        return;
+        return 0;
     }
     use std::io::BufRead;
     for (k, line) in std::io::stdin().lock().lines().enumerate() {
@@ -199,5 +200,17 @@ fn main() {
             },
         };
         println!("{resp}");
+    }
+    0
+}
+
+fn main() {
+    let mut code = main_run();
+    if let Err(error) = sc_faber::socle::close_cache() {
+        eprintln!("error: 缓存关闭失败：{error}");
+        code = 2;
+    }
+    if code != 0 {
+        std::process::exit(code);
     }
 }

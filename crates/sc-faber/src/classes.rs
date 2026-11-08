@@ -105,27 +105,31 @@ pub fn int_against(cl: &TautClass, kappa: &[(u32, u32)], psi: &[(u32, u32)]) -> 
     if let Some(t) = cl.terms.first() {
         crate::kppoly::check_marking_legs(psi, t.graph.num_markings())?;
     }
-    if cl.terms.len() < 32 {
-        let mut pairing = Pairing::new(kappa, psi);
-        return cl.terms.iter().try_fold(Q::ZERO, |sum, t| {
-            Ok(sum + pairing.evaluate(&t.graph, &t.poly)?)
-        });
-    }
-    let threads = sc_num::parallel::thread_count("SC_FABER_THREADS", 16);
-    sc_num::parallel::chunks(
-        cl.terms.len(),
-        8,
-        threads,
-        || Pairing::new(kappa, psi),
-        |pairing, mut range| {
-            range.try_fold(Q::ZERO, |sum, i| {
-                let t = &cl.terms[i];
+    crate::cache_source::with_inherited_registry(|context| {
+        if cl.terms.len() < 32 {
+            let mut pairing = Pairing::new(kappa, psi);
+            return cl.terms.iter().try_fold(Q::ZERO, |sum, t| {
                 Ok(sum + pairing.evaluate(&t.graph, &t.poly)?)
-            })
-        },
-    )
-    .into_iter()
-    .try_fold(Q::ZERO, |sum, part: Result<Q, String>| Ok(sum + part?))
+            });
+        }
+        let threads = sc_num::parallel::thread_count("SC_FABER_THREADS", 16);
+        sc_num::parallel::chunks(
+            cl.terms.len(),
+            8,
+            threads,
+            || Pairing::new(kappa, psi),
+            |pairing, mut range| {
+                context.run(|| {
+                    range.try_fold(Q::ZERO, |sum, i| {
+                        let t = &cl.terms[i];
+                        Ok(sum + pairing.evaluate(&t.graph, &t.poly)?)
+                    })
+                })
+            },
+        )
+        .into_iter()
+        .try_fold(Q::ZERO, |sum, part: Result<Q, String>| Ok(sum + part?))
+    })
 }
 
 /// Reuses external kappa distributions and graph automorphisms while streaming terms.
@@ -227,6 +231,32 @@ fn kappa_distributions(groups: &[(u32, u32)], nv: usize) -> Vec<(Vec<Vec<u32>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_pairing_publishes_vertex_socle_values_to_its_owner() {
+        let graph = StableGraph::new(&[2], &[vec![1]], &[]).unwrap();
+        // Keep separate public terms to exercise the >=32-term pool route.
+        let class = TautClass {
+            terms: (0..64)
+                .map(|_| DecStratum {
+                    graph: graph.clone(),
+                    poly: KP::one(),
+                })
+                .collect(),
+        };
+        let registry = std::sync::Arc::new(crate::cache_source::Registry::new());
+        let actual = crate::cache_source::with_registry(registry.clone(), || {
+            int_against(&class, &[], &[(1, 4)])
+        })
+        .unwrap();
+        assert_eq!(actual, Q::from_signeds(1, 18));
+        assert!(
+            registry
+                .sources()
+                .iter()
+                .any(|source| source.ready() > source.floor())
+        );
+    }
 
     /// Θ 类初始条件独立可验的近亲：Hain(1,(1,−1)) = ψ₁+ψ₂+δ/2 …admcycles 差分见
     /// tools；先验已知：g=1 时 D = (1/2)(Σ A_i² ψ_i + …) 紧型上 = DR。
@@ -646,9 +676,24 @@ pub fn int_dr_chiodo_poly(
     psi: &[(u32, u32)],
 ) -> Result<Q, String> {
     crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
-    with_chiodo_poly(g, a, d, k, spin, Some(psi), |degree, visit| {
-        crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
-    })
+    validate_chiodo_poly(g, a, k, spin)?;
+    use crate::hodge::root_source::{named_i64, named_i64s, named_powers, with_named};
+    with_named(
+        "scalar-chiodo-v1",
+        || {
+            let mut key = vec![g, d, u32::from(spin)];
+            named_i64(&mut key, k);
+            named_i64s(&mut key, a);
+            named_powers(&mut key, kappa);
+            named_powers(&mut key, psi);
+            key
+        },
+        || {
+            with_chiodo_poly_prepared(g, a, d, k, spin, Some(psi), |degree, visit| {
+                crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
+            })
+        },
+    )
 }
 
 fn with_chiodo_poly<R>(
@@ -660,6 +705,11 @@ fn with_chiodo_poly<R>(
     external_psi: Option<&[(u32, u32)]>,
     consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
 ) -> Result<R, String> {
+    validate_chiodo_poly(g, a, k, spin)?;
+    with_chiodo_poly_prepared(g, a, d, k, spin, external_psi, consume)
+}
+
+fn validate_chiodo_poly(g: u32, a: &[i64], k: i64, spin: bool) -> Result<(), String> {
     let n = a.len() as u32;
     let asum: i64 = a.iter().sum();
     let chi = 2 * g as i64 - 2 + n as i64;
@@ -678,6 +728,18 @@ fn with_chiodo_poly<R>(
             return Err("spin DR 的 k 须为奇数".into());
         }
     }
+    Ok(())
+}
+
+fn with_chiodo_poly_prepared<R>(
+    g: u32,
+    a: &[i64],
+    d: u32,
+    k: i64,
+    spin: bool,
+    external_psi: Option<&[(u32, u32)]>,
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
     let abs_sum: i64 = a.iter().map(|x| x.abs()).sum();
     let m0 = (abs_sum + 1) / 2 + g as i64 * k.abs();
     let start = m0 + 1;
@@ -901,7 +963,17 @@ pub fn hyperell_pair(
     if n > 2 * g + 2 {
         return Err(format!("固定标记 {n} > 分支点数 {}", 2 * g + 2));
     }
-    z2_pair(0, 2 * g + 2, n, m, kappa, psi)
+    with_named_z2(
+        "scalar-hyperell-pair-v1",
+        g,
+        n,
+        m,
+        2 * g + 2,
+        false,
+        kappa,
+        psi,
+        || z2_pair(0, 2 * g + 2, n, m, kappa, psi),
+    )
 }
 
 /// 双椭圆配对：源亏格 g 的 C 双覆盖椭圆曲线（2g−2 分支，m 共轭对；商亏格 1）。
@@ -918,7 +990,54 @@ pub fn biell_pair(
     if n > 2 * g - 2 {
         return Err(format!("固定标记 {n} > 分支点数 {}", 2 * g - 2));
     }
-    z2_pair(1, 2 * g - 2, n, m, kappa, psi)
+    with_named_z2(
+        "scalar-biell-pair-v1",
+        g,
+        n,
+        m,
+        2 * g - 2,
+        false,
+        kappa,
+        psi,
+        || z2_pair(1, 2 * g - 2, n, m, kappa, psi),
+    )
+}
+
+fn with_named_z2(
+    kind: &'static str,
+    g: u32,
+    n: u32,
+    m: u32,
+    branch: u32,
+    compact_legs: bool,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    calculate: impl FnOnce() -> Result<Q, String>,
+) -> Result<Q, String> {
+    // Match z2_pair's existing leg check before a persisted root can answer.
+    // Pair and compact-leg namespaces remain distinct when n == branch.
+    let full = branch + 2 * m;
+    for &(leg, _) in psi {
+        let leg = if compact_legs && leg > n {
+            leg - n + branch
+        } else {
+            leg
+        };
+        if leg == 0 || leg > full {
+            return Err(format!("标记腿 {leg} 超出 1..={full}"));
+        }
+    }
+    use crate::hodge::root_source::{named_powers, with_named};
+    with_named(
+        kind,
+        || {
+            let mut key = vec![g, n, m];
+            named_powers(&mut key, kappa);
+            named_powers(&mut key, psi);
+            key
+        },
+        calculate,
+    )
 }
 
 fn kappa_parts(kappa: &[(u32, u32)]) -> Vec<u32> {
@@ -1300,7 +1419,17 @@ pub fn hyperell_int(
     if n > 2 * g + 2 {
         return Err(format!("固定标记 {n} > 分支点数 {}", 2 * g + 2));
     }
-    z2_int(0, 2 * g + 2, n, m, kappa, psi, false)
+    with_named_z2(
+        "scalar-hyperell-v1",
+        g,
+        n,
+        m,
+        2 * g + 2,
+        true,
+        kappa,
+        psi,
+        || z2_int(0, 2 * g + 2, n, m, kappa, psi, false),
+    )
 }
 
 /// ∫_{M̄_{g,n+2m}} Biell(g,n,m) · X（X 为 κ-ψ 单项式，紧凑腿号）。
@@ -1317,5 +1446,15 @@ pub fn biell_int(
     if n > 2 * g - 2 {
         return Err(format!("固定标记 {n} > 分支点数 {}", 2 * g - 2));
     }
-    z2_int(1, 2 * g - 2, n, m, kappa, psi, g == 2 && n == 0 && m == 0)
+    with_named_z2(
+        "scalar-biell-v1",
+        g,
+        n,
+        m,
+        2 * g - 2,
+        true,
+        kappa,
+        psi,
+        || z2_int(1, 2 * g - 2, n, m, kappa, psi, g == 2 && n == 0 && m == 0),
+    )
 }

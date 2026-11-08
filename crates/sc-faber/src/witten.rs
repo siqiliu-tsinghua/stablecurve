@@ -341,9 +341,32 @@ pub fn int_witten(
     psi: &[(u32, u32)],
 ) -> Result<Q, String> {
     crate::kppoly::check_marking_legs(psi, a.len() as u32)?;
-    with_witten(g, a, Some(psi), |degree, visit| {
-        crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
-    })
+    let parameters = witten_parameters(g, a)?;
+    use crate::hodge::root_source::{named_i64, named_len, named_powers, with_named_policy};
+    with_named_policy(
+        "scalar-witten-v1",
+        || {
+            let mut key = vec![g];
+            named_len(&mut key, a.len());
+            for &(cn, cd, d) in a {
+                named_i64(&mut key, cn);
+                named_i64(&mut key, cd);
+                named_i64(&mut key, d);
+            }
+            named_powers(&mut key, kappa);
+            named_powers(&mut key, psi);
+            key
+        },
+        parameters.is_some(),
+        || match parameters {
+            None => Ok(Q::ZERO),
+            Some((step, degree)) => {
+                with_witten_prepared(g, a, step, degree, Some(psi), |degree, visit| {
+                    crate::graph_sum::integrate(g, a.len() as u32, degree, kappa, psi, visit)
+                })
+            }
+        },
+    )
 }
 
 fn with_witten<R: Default>(
@@ -352,13 +375,20 @@ fn with_witten<R: Default>(
     external_psi: Option<&[(u32, u32)]>,
     consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
 ) -> Result<R, String> {
-    let n = a.len() as u32;
+    let Some((step, degree)) = witten_parameters(g, a)? else {
+        return Ok(R::default());
+    };
+    with_witten_prepared(g, a, step, degree, external_psi, consume)
+}
+
+// Preserve the original early-zero priority over denominator validation.
+fn witten_parameters(g: u32, a: &[(i64, i64, i64)]) -> Result<Option<(i64, u32)>, String> {
     let dsum: i64 = a.iter().map(|&(_, _, d)| d).sum();
     if dsum != 2 * g as i64 - 2 {
         return Err(format!("ΣD={dsum} ≠ 2g−2={}", 2 * g as i64 - 2));
     }
     if a.iter().any(|&(cn, cd, d)| cn == cd && d == -1) {
-        return Ok(R::default());
+        return Ok(None);
     }
     let mut step: i64 = 1;
     for &(_, cd, _) in a {
@@ -373,6 +403,18 @@ fn with_witten<R: Default>(
     }
     let c_sum = cnum_sum / step;
     let d_deg = (g as i64 - 1 + c_sum).max(0) as u32;
+    Ok(Some((step, d_deg)))
+}
+
+fn with_witten_prepared<R>(
+    g: u32,
+    a: &[(i64, i64, i64)],
+    step: i64,
+    d_deg: u32,
+    external_psi: Option<&[(u32, u32)]>,
+    consume: impl FnOnce(u32, &crate::graph_sum::Visit<'_>) -> Result<R, String>,
+) -> Result<R, String> {
+    let n = a.len() as u32;
     let abs_d: i64 = a.iter().map(|&(_, _, d)| d.abs()).sum();
     let m0 = ((abs_d + 1) / 2 + g as i64 + 1) * step;
 

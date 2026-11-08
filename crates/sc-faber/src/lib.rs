@@ -12,6 +12,7 @@
 //!   （admcycles 对标增量）；
 //! - [`witten`] / [`grr`]：Witten r-旋、广义 Hodge chern（GRRcomp）。
 
+mod cache_source;
 pub mod classes;
 pub mod dr;
 mod flow;

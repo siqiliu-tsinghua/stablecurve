@@ -10,17 +10,27 @@
 //! 和 C 指标按重数分配；string/dilaton 先消去 0/1 次标记。
 
 use super::{ChMono, ch_mul, fact, lambda_expansion};
+use crate::cache_source::Registry;
 use crate::socle::bernoulli;
 use sc_num::{One, Q, Zero};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
 
+#[cfg(test)]
+mod measure_serial;
 mod parallel;
+mod serial_source;
+
+use serial_source::{SerialSource, SerialValues};
 
 #[derive(Default)]
 struct Descendents {
     // ch 与 ψ 的总次数已决定亏格。分两层存储，使命中时可直接借用 ch 切片。
-    values: BTreeMap<Vec<(u32, u32)>, BTreeMap<Vec<u32>, Q>>,
+    values: SerialValues,
+    source: Option<Arc<SerialSource>>,
+    #[cfg(test)]
+    shared_values: Option<std::sync::Arc<std::sync::RwLock<measure_serial::SerialValues>>>,
     grr: Vec<Q>,
     factorials: Vec<Q>,
     odd_factorials: Vec<Q>,
@@ -30,6 +40,44 @@ struct Descendents {
 
 thread_local! {
     static DESCENDENTS: RefCell<Descendents> = RefCell::new(Descendents::default());
+    static CACHED_DESCENDENTS: RefCell<BTreeMap<u64, CachedDescendents>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+struct CachedDescendents {
+    registry: Weak<Registry>,
+    evaluator: Descendents,
+}
+
+pub(super) fn clear_cache_context(id: u64) {
+    CACHED_DESCENDENTS.with(|cell| {
+        cell.borrow_mut().remove(&id);
+    });
+    parallel::clear_cache_context(id);
+}
+
+fn with_descendents(
+    registry: Option<&Arc<Registry>>,
+    calculate: impl FnOnce(&mut Descendents) -> Q,
+) -> Q {
+    let Some(registry) = registry else {
+        return DESCENDENTS.with(|cell| calculate(&mut cell.borrow_mut()));
+    };
+    CACHED_DESCENDENTS.with(|cell| {
+        let mut contexts = cell.borrow_mut();
+        if let Some(context) = contexts.get_mut(&registry.id()) {
+            return calculate(&mut context.evaluator);
+        }
+        // Do not scan every historical memo or evict another live instance's
+        // values when a query switches its cache attachment.
+        contexts.retain(|_, context| context.registry.strong_count() != 0);
+        let context = contexts
+            .entry(registry.id())
+            .or_insert_with(|| CachedDescendents {
+                registry: Arc::downgrade(registry),
+                evaluator: Descendents::with_registry(Some(registry)),
+            });
+        calculate(&mut context.evaluator)
+    })
 }
 
 fn multinomial(d: &[u32]) -> Q {
@@ -146,32 +194,132 @@ fn integrate_ch_roots(
             poly = collect_terms(ch_mul(&poly, &expansion));
         }
     }
-    DESCENDENTS.with(|cell| {
-        let mut evaluator = cell.borrow_mut();
-        for (ch, coefficient) in &mut poly {
-            for &(m, p) in ch.iter() {
-                let factor = evaluator.grr_factor(m);
-                for _ in 0..p {
-                    *coefficient *= &factor;
+    crate::cache_source::with_current_registry(|registry| {
+        with_descendents(registry, |evaluator| {
+            for (ch, coefficient) in &mut poly {
+                for &(m, p) in ch.iter() {
+                    let factor = evaluator.grr_factor(m);
+                    for _ in 0..p {
+                        *coefficient *= &factor;
+                    }
                 }
             }
-        }
-        if threads > 1 {
-            return parallel::integrate(g, roots, &poly, &mut evaluator, threads);
-        }
-        let mut sum = Q::ZERO;
-        for (d, c) in roots {
-            for (ch, coefficient) in &poly {
-                sum += c * coefficient * evaluator.eval(g, d.clone(), ch);
+            if threads > 1 {
+                return parallel::integrate(g, roots, &poly, evaluator, threads, registry);
             }
-        }
-        sum
+            if registry
+                .is_some_and(|registry| registry.has_history() && registry.check_error().is_ok())
+            {
+                let mut sum = Q::ZERO;
+                for (d, c) in roots {
+                    for (ch, coefficient) in &poly {
+                        let value = if let Some(value) = evaluator.memoized_root(g, d, ch) {
+                            value
+                        } else if direct_root(g, d, ch) {
+                            evaluator.eval(g, d.clone(), ch)
+                        } else {
+                            // Reuse the existing layered planner only for the
+                            // historical L2 miss path. One evaluation thread
+                            // still permits frontier-sized storage requests.
+                            return parallel::integrate(g, roots, &poly, evaluator, 1, registry);
+                        };
+                        sum += c * coefficient * value;
+                    }
+                }
+                return sum;
+            }
+            let has_parallel_cache =
+                registry.is_some_and(|registry| parallel::has_cached_engine(registry));
+            if !has_parallel_cache {
+                let mut sum = Q::ZERO;
+                for (d, c) in roots {
+                    for (ch, coefficient) in &poly {
+                        let value = evaluator
+                            .memoized_root(g, d, ch)
+                            .unwrap_or_else(|| evaluator.eval(g, d.clone(), ch));
+                        sum += c * coefficient * value;
+                    }
+                }
+                return sum;
+            }
+            let mut sum = Q::ZERO;
+            for (d, c) in roots {
+                for (ch, coefficient) in &poly {
+                    if let Some(value) = evaluator.memoized_root(g, d, ch) {
+                        sum += c * coefficient * value;
+                        continue;
+                    }
+                    let mut descendants = d.clone();
+                    let cached = registry.and_then(|registry| {
+                        descendants.sort_unstable();
+                        let n = descendants.len() as i64;
+                        let weight = ch
+                            .iter()
+                            .map(|&(m, p)| i64::from(m) * i64::from(p))
+                            .sum::<i64>();
+                        if 2 * i64::from(g) - 2 + n > 0
+                            && weight
+                                + descendants
+                                    .iter()
+                                    .map(|&power| i64::from(power))
+                                    .sum::<i64>()
+                                == 3 * i64::from(g) - 3 + n
+                        {
+                            parallel::cached(g, &descendants, ch, registry)
+                        } else {
+                            None
+                        }
+                    });
+                    let value = cached.unwrap_or_else(|| evaluator.eval(g, descendants, ch));
+                    sum += c * coefficient * value;
+                }
+            }
+            sum
+        })
     })
 }
 
 pub(super) fn pure(g: u32, d: &[u32]) -> Q {
     if thread_count(g, 16) == 1 {
-        DESCENDENTS.with(|cell| cell.borrow_mut().eval(g, d.to_vec(), &[]))
+        crate::cache_source::with_current_registry(|registry| {
+            with_descendents(registry, |evaluator| {
+                if let Some(value) = evaluator.memoized_root(g, d, &[]) {
+                    return value;
+                }
+                let mut descendants = d.to_vec();
+                if let Some(registry) =
+                    registry.filter(|registry| parallel::has_cached_engine(registry))
+                {
+                    descendants.sort_unstable();
+                    let n = descendants.len() as i64;
+                    if 2 * i64::from(g) - 2 + n > 0
+                        && descendants
+                            .iter()
+                            .map(|&power| i64::from(power))
+                            .sum::<i64>()
+                            == 3 * i64::from(g) - 3 + n
+                    {
+                        if let Some(value) = parallel::cached(g, &descendants, &[], registry) {
+                            return value;
+                        }
+                    }
+                }
+                if registry.is_some_and(|registry| {
+                    registry.has_history() && registry.check_error().is_ok()
+                }) && !direct_root(g, &descendants, &[])
+                {
+                    return parallel::integrate(
+                        g,
+                        &[(descendants, Q::ONE)],
+                        &[(vec![], Q::ONE)],
+                        evaluator,
+                        1,
+                        registry,
+                    );
+                }
+                evaluator.eval(g, descendants, &[])
+            })
+        })
     } else {
         pure_sum(g, &[(d.to_vec(), Q::ONE)])
     }
@@ -253,7 +401,71 @@ fn collect_terms(mut terms: Vec<ChMono>) -> Vec<ChMono> {
     out
 }
 
+// These are the original inexpensive eval guards and closed formulas. They
+// keep their local path instead of waiting for storage during recovery.
+fn direct_root(g: u32, d: &[u32], ch: &[(u32, u32)]) -> bool {
+    let n = d.len() as i64;
+    let weight: u64 = ch.iter().map(|&(m, p)| u64::from(m) * u64::from(p)).sum();
+    if 2 * i64::from(g) - 2 + n <= 0
+        || weight as i128 + d.iter().map(|&power| i128::from(power)).sum::<i128>()
+            != 3 * i128::from(g) - 3 + i128::from(n)
+    {
+        return true;
+    }
+    if ch.is_empty() {
+        g == 0 || d.len() == 1
+    } else {
+        g == 0 || ch.last().unwrap().0 >= 2 * g || weight > u64::from((3 * g - 3).max(1)) || g == 1
+    }
+}
+
 impl Descendents {
+    pub(super) fn with_registry(registry: Option<&Arc<Registry>>) -> Self {
+        let source = registry.map(|registry| {
+            let source = Arc::new(SerialSource::default());
+            registry.register(source.clone());
+            source
+        });
+        Self {
+            source,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn with_memo<R>(&self, read: impl FnOnce(&SerialValues) -> R) -> R {
+        if let Some(source) = &self.source {
+            return read(source.read().values());
+        }
+        #[cfg(test)]
+        if let Some(shared) = &self.shared_values {
+            return read(&shared.read().unwrap());
+        }
+        read(&self.values)
+    }
+
+    fn memoized_root(&self, g: u32, d: &[u32], ch: &[(u32, u32)]) -> Option<Q> {
+        let source = self.source.as_ref()?;
+        let n = d.len() as i64;
+        let weight: u32 = ch.iter().map(|&(m, p)| m * p).sum();
+        // The original memo omits g because a valid top-degree state fixes it.
+        // Check that invariant before borrowing a caller's key without eval.
+        if !d.is_sorted()
+            || 2 * i64::from(g) - 2 + n <= 0
+            || i64::from(weight) + d.iter().map(|&power| i64::from(power)).sum::<i64>()
+                != 3 * i64::from(g) - 3 + n
+        {
+            return None;
+        }
+        source.get(d, ch)
+    }
+
+    fn finish_formula(&self, g: u32, d: Vec<u32>, ch: &[(u32, u32)], value: Q) -> Q {
+        if let Some(source) = &self.source {
+            source.insert(g, d, ch, &value);
+        }
+        value
+    }
+
     fn factorial(&mut self, n: usize) -> Q {
         while self.factorials.len() <= n {
             let value = self
@@ -315,9 +527,15 @@ impl Descendents {
             return Q::ZERO;
         }
         d.sort_unstable();
+        if let Some(source) = &self.source {
+            if let Some(value) = source.get(&d, ch) {
+                return value;
+            }
+        }
         if ch.is_empty() {
             if g == 0 {
-                return self.multinomial(&d);
+                let value = self.multinomial(&d);
+                return self.finish_formula(g, d, ch, value);
             }
             if d.len() == 1 {
                 while self.one_point.len() <= g as usize {
@@ -326,22 +544,37 @@ impl Descendents {
                     });
                     self.one_point.push(value);
                 }
-                return self.one_point[g as usize].clone();
+                return self.finish_formula(g, d, ch, self.one_point[g as usize].clone());
             }
         } else if g == 0 || ch.last().unwrap().0 >= 2 * g || weight > (3 * g - 3).max(1) {
-            return Q::ZERO;
+            return self.finish_formula(g, d, ch, Q::ZERO);
         } else if g == 1 {
             // C₁ = 12λ₁；∫λ₁Πψ^d = multinomial(d)/24。
-            return self.multinomial(&d) / Q::from(2);
+            let value = self.multinomial(&d) / Q::from(2);
+            return self.finish_formula(g, d, ch, value);
         }
-        if let Some(value) = self.values.get(ch).and_then(|values| values.get(&d)) {
-            return value.clone();
+        if self.source.is_none() {
+            #[cfg(test)]
+            if let Some(value) = self.measurement_memo_get(&d, ch) {
+                return value;
+            }
+            #[cfg(not(test))]
+            if let Some(value) = self.values.get(ch).and_then(|values| values.get(&d)) {
+                return value.clone();
+            }
         }
         let value = self.compute(g, &d, ch);
-        self.values
-            .entry(ch.to_vec())
-            .or_default()
-            .insert(d, value.clone());
+        if let Some(source) = &self.source {
+            source.insert(g, d, ch, &value);
+        } else {
+            #[cfg(test)]
+            self.measurement_memo_insert(d, ch, &value);
+            #[cfg(not(test))]
+            self.values
+                .entry(ch.to_vec())
+                .or_default()
+                .insert(d, value.clone());
+        }
         value
     }
 
@@ -587,6 +820,56 @@ mod tests {
     use super::*;
     use crate::hodge::{int_class, klp};
 
+    #[test]
+    fn borrowed_root_memo_validates_genus_dimension_and_c_semantics() {
+        let registry = Arc::new(Registry::new());
+        let mut evaluator = Descendents::with_registry(Some(&registry));
+        let expected = Q::from_signeds(1, 384);
+        assert_eq!(evaluator.eval(2, vec![1, 4], &[]), expected);
+        assert_eq!(evaluator.memoized_root(2, &[1, 4], &[]), Some(expected));
+        assert_eq!(evaluator.memoized_root(3, &[1, 4], &[]), None);
+        assert_eq!(evaluator.memoized_root(2, &[1, 3], &[]), None);
+        assert_eq!(evaluator.memoized_root(0, &[], &[]), None);
+        assert_eq!(evaluator.memoized_root(2, &[4, 1], &[]), None);
+
+        // The descendant source holds C_1 = 12 lambda_1, without the outer
+        // Bernoulli factor used to recover true ch/lambda values.
+        assert_eq!(evaluator.eval(1, vec![0], &[(1, 1)]), Q::from_signeds(1, 2));
+        assert_eq!(
+            evaluator.memoized_root(1, &[0], &[(1, 1)]),
+            Some(Q::from_signeds(1, 2)),
+        );
+        assert_eq!(evaluator.memoized_root(1, &[0], &[]), None);
+        assert_eq!(evaluator.eval(0, vec![0; 4], &[(1, 1)]), Q::ZERO);
+        assert_eq!(
+            evaluator.memoized_root(0, &[0; 4], &[(1, 1)]),
+            Some(Q::ZERO),
+        );
+
+        let mut original = Descendents::default();
+        assert_eq!(original.eval(2, vec![1, 4], &[]), Q::from_signeds(1, 384));
+        assert_eq!(original.memoized_root(2, &[1, 4], &[]), None);
+    }
+
+    #[test]
+    fn cached_serial_roots_preserve_unsorted_aliases_and_reject_wrong_genus() {
+        use crate::cache_source::with_registry;
+
+        let registry = Arc::new(Registry::new());
+        with_registry(registry.clone(), || {
+            let calculate = |g, d| integrate_ch_roots(g, &[(d, Q::ONE)], &[], &[], 1);
+            let expected = Q::from_signeds(1, 384);
+            assert_eq!(calculate(2, vec![1, 4]), expected);
+            let source = registry.sources().pop().unwrap();
+            let ready = source.ready();
+            assert_eq!(calculate(2, vec![1, 4]), expected);
+            assert_eq!(calculate(2, vec![4, 1]), expected);
+            assert_eq!(calculate(3, vec![1, 4]), Q::ZERO);
+            assert_eq!(calculate(0, vec![]), Q::ZERO);
+            assert_eq!(source.ready(), ready);
+        });
+    }
+
     fn legacy(g: u32, d: &[u32], lambda: &[(u32, u32)]) -> Q {
         let psi: Vec<_> = d
             .iter()
@@ -771,6 +1054,7 @@ mod tests {
                 &[(vec![], Q::ONE)],
                 &mut Descendents::default(),
                 4,
+                None,
             );
             assert_eq!(result, expected);
         })

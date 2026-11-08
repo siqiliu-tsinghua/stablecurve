@@ -14,13 +14,26 @@
 //! 与原版的实现差异：类以**语义指标**传递（κ_j、ch_c），省去原版的线性
 //! 下标平移（i+2/i+1/−2n 等在两侧同义）。
 
+use crate::cache_source::legacy_source::LegacySource;
+use crate::cache_source::{IntegralKey, Registry};
 use crate::kppoly::{KappaPsiPolynomial as KP, KpTerm};
 use crate::push::push;
 use crate::socle::bernoulli;
 use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
+use std::sync::{Arc, Weak};
 
 mod psi;
+pub(crate) mod root_source;
+
+pub(crate) fn clear_cache_context(id: u64) {
+    psi::clear_cache_context(id);
+    IC_SOURCES.with(|sources| {
+        if let Ok(mut sources) = sources.try_borrow_mut() {
+            sources.remove(&id);
+        }
+    });
+}
 
 pub(crate) fn psi_integral(g: u32, powers: &[u32]) -> Q {
     psi::pure(g, powers)
@@ -149,14 +162,50 @@ fn ch_mul(a: &[ChMono], b: &[ChMono]) -> Vec<ChMono> {
     normalize_ch(out)
 }
 
-// int_class 的进程内记忆化。
+type IcKey = (u32, u32, Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>);
+
+// int_class 的原内存模式与按缓存归属隔离的可读取数学表。
 thread_local! {
-    static IC_MEMO: std::cell::RefCell<
-        std::collections::HashMap<
-            (u32, u32, Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>),
-            Q,
-        >,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static IC_MEMO: std::cell::RefCell<std::collections::HashMap<IcKey, Q>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static IC_SOURCES: std::cell::RefCell<std::collections::BTreeMap<u64, Weak<LegacySource<IcKey>>>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn ic_source(registry: &Registry) -> Arc<LegacySource<IcKey>> {
+    IC_SOURCES.with(|cell| {
+        let mut sources = cell.borrow_mut();
+        if let Some(source) = sources.get(&registry.id()).and_then(Weak::upgrade) {
+            return source;
+        }
+        sources.retain(|_, source| source.strong_count() != 0);
+        let source = Arc::new(LegacySource::new("ic", ic_nums));
+        registry.register(source.clone());
+        sources.insert(registry.id(), Arc::downgrade(&source));
+        source
+    })
+}
+
+// 三个分量的长度均是扁平 u32 元素数，保持旧 st 表 ic 键的边界语义。
+// 正常计算只在确需 L2 查找时编码；后台 pull 自行调用同一个函数。
+fn ic_nums(key: &IcKey) -> Vec<u32> {
+    let (g, n, kappa, psi, ch) = key;
+    [
+        *g,
+        *n,
+        (kappa.len() * 2) as u32,
+        (psi.len() * 2) as u32,
+        (ch.len() * 2) as u32,
+    ]
+    .into_iter()
+    .chain(
+        kappa
+            .iter()
+            .chain(psi)
+            .chain(ch)
+            .flat_map(|&(index, power)| [index, power]),
+    )
+    .collect()
 }
 
 /// ∫_{M̄_{g,n}} κ^κ · ψ^ψ · ch^ch（全部语义指标；单项式）。
@@ -167,7 +216,6 @@ pub fn int_class(
     psi: &[(u32, u32)],
     ch: &[(u32, u32)],
 ) -> Result<Q, String> {
-    use crate::socle::{cache_get, cache_put};
     // 键规范化：各分量排序，避免同子问题因构造路径不同而 miss
     let kappa = normalized_powers(kappa);
     let psi = normalized_powers(psi);
@@ -178,43 +226,77 @@ pub fn int_class(
         + psi.iter().map(|&(_, p)| p).sum::<u32>()
         + ch.iter().map(|&(c, p)| c * p).sum::<u32>();
     if w as i64 != 3 * g as i64 - 3 + n as i64 {
-        return Ok(Q::ZERO);
+        return crate::cache_source::with_current_registry(|registry| {
+            let Some(registry) = registry else {
+                return Ok(Q::ZERO);
+            };
+            // The historical non-top zero return precedes input rejection.
+            // Keep that return order, but publish only actual stable-space
+            // integrals: malformed auxiliary zeros are not mathematical roots.
+            if 2 * i64::from(g) - 2 + i64::from(n) <= 0
+                || kappa.iter().any(|&(index, _)| index == 0)
+                || psi.iter().any(|&(leg, _)| leg == 0 || leg > n)
+                || ch.iter().any(|&(index, _)| index == 0 || index % 2 == 0)
+            {
+                return Ok(Q::ZERO);
+            }
+            root_source::with_registry_policy(
+                registry.clone(),
+                g,
+                n,
+                &kappa,
+                &psi,
+                &[],
+                &ch,
+                false,
+                || Ok(Q::ZERO),
+            )
+        });
     }
     let key = (g, n, kappa.clone(), psi.clone(), ch.clone());
-    if let Some(v) = IC_MEMO.with(|m| m.borrow().get(&key).cloned()) {
-        return Ok(v);
-    }
-    // 键编码必须含全部三个分量的长度（否则 ψ/ch 分界歧义 → 键碰撞 → 脏值）
-    let flat: Vec<u32> = [
-        g,
-        n,
-        (kappa.len() * 2) as u32,
-        (psi.len() * 2) as u32,
-        (ch.len() * 2) as u32,
-    ]
-    .into_iter()
-    .chain(kappa.iter().flat_map(|&(a, b)| [a, b]))
-    .chain(psi.iter().flat_map(|&(a, b)| [a, b]))
-    .chain(ch.iter().flat_map(|&(a, b)| [a, b]))
-    .collect();
-    if let Some(v) = cache_get("ic", &flat) {
-        IC_MEMO.with(|m| m.borrow_mut().insert(key.clone(), v.clone()));
-        return Ok(v);
-    }
-    let r = int_class_inner(g, n, &kappa, &psi, &ch);
-    if std::env::var_os("SC_FABER_TRACE").is_some() {
-        eprintln!(
-            "TRACE int_class(g={g},n={n},k={kappa:?},p={psi:?},ch={ch:?}) = {:?}",
-            r.as_ref()
-                .map(|q| q.to_string())
-                .unwrap_or_else(|e| e.clone())
-        );
-    }
-    if let Ok(v) = &r {
-        IC_MEMO.with(|m| m.borrow_mut().insert(key, v.clone()));
-        cache_put("ic", &flat, v);
-    }
-    r
+    crate::cache_source::with_current_registry(|registry| {
+        let source = if let Some(registry) = registry {
+            registry.check_error()?;
+            let source = ic_source(registry);
+            if let Some(value) = source.get(&key) {
+                return Ok(value);
+            }
+            if registry.has_history() {
+                if let Some(value) = registry.lookup(IntegralKey::Legacy {
+                    kind: "ic".to_owned(),
+                    nums: ic_nums(&key),
+                })? {
+                    source.insert(key, &value);
+                    return Ok(value);
+                }
+            }
+            Some(source)
+        } else {
+            if let Some(value) = IC_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+                return Ok(value);
+            }
+            None
+        };
+        // No mathematical source lock or TLS memo borrow spans recursion.
+        let result = int_class_inner(g, n, &kappa, &psi, &ch);
+        if std::env::var_os("SC_FABER_TRACE").is_some() {
+            eprintln!(
+                "TRACE int_class(g={g},n={n},k={kappa:?},p={psi:?},ch={ch:?}) = {:?}",
+                result
+                    .as_ref()
+                    .map(|q| q.to_string())
+                    .unwrap_or_else(|error| error.clone())
+            );
+        }
+        if let Ok(value) = &result {
+            if let Some(source) = source {
+                source.insert(key, value);
+            } else {
+                IC_MEMO.with(|memo| memo.borrow_mut().insert(key, value.clone()));
+            }
+        }
+        result
+    })
 }
 
 fn int_class_inner(
@@ -475,18 +557,102 @@ pub fn klp(
     let kappa = &normalized_powers(kappa)[..];
     let ch = &normalized_powers(ch)[..];
     let lambda = &normalized_powers(lambda)[..];
-    if 2 * g as i64 - 2 + n as i64 <= 0 {
+    // Errors and the established zero/pure/mixed route are decided before any
+    // root cache can return a value for an otherwise rejected input.
+    let route = klp_route(g, n, kappa, psi, lambda, ch)?;
+    let calculate = || -> Result<Q, String> {
+        Ok(match route {
+            KlpRoute::Zero => Q::ZERO,
+            KlpRoute::Pure => psi::integrate(g, n, psi, lambda),
+            KlpRoute::Mixed => psi::integrate_mixed(g, n, kappa, psi, lambda, ch),
+        })
+    };
+    // 固定本次调用的结果归属。未启用缓存时不建立根结果目录或后台读取口。
+    if let Some(registry) = crate::cache_source::current_registry() {
+        let read_history = !inexpensive_klp(g, n, psi, lambda, ch, route);
+        return root_source::with_registry_policy(
+            registry,
+            g,
+            n,
+            kappa,
+            psi,
+            lambda,
+            ch,
+            read_history,
+            calculate,
+        );
+    }
+    crate::cache_source::with_optional_registry(None, calculate)
+}
+
+#[derive(Clone, Copy)]
+enum KlpRoute {
+    Zero,
+    Pure,
+    Mixed,
+}
+
+// Select a cache access policy, without evaluating a second mathematical
+// formula. These cases already have a short exact formula or a zero guard in
+// the original evaluator, so a cold L1 should not wait for an SQLite request.
+fn inexpensive_klp(
+    g: u32,
+    n: u32,
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+    route: KlpRoute,
+) -> bool {
+    match route {
+        KlpRoute::Zero => true,
+        KlpRoute::Mixed => false,
+        KlpRoute::Pure => {
+            let weight: u64 = lambda
+                .iter()
+                .map(|&(index, power)| u64::from(index) * u64::from(power))
+                .sum();
+            let psi_weight: u64 = psi.iter().map(|&(_, power)| u64::from(power)).sum();
+            let factors = lambda.iter().filter(|&&(index, _)| index > 0);
+            let top_power = lambda
+                .iter()
+                .filter(|&&(index, _)| index == g && g > 0)
+                .map(|&(_, power)| u64::from(power))
+                .sum::<u64>();
+            weight + psi_weight != (3 * i64::from(g) - 3 + i64::from(n)) as u64
+                || top_power >= 2
+                || weight
+                    > if g > 1 {
+                        3 * u64::from(g) - 3
+                    } else {
+                        u64::from(g)
+                    }
+                || (ch.is_empty()
+                    && ((factors.clone().count() == 0 && (g <= 1 || n == 1))
+                        || (g > 0 && factors.copied().eq([(g, 1)]))))
+        }
+    }
+}
+
+fn klp_route(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+) -> Result<KlpRoute, String> {
+    if 2 * i64::from(g) - 2 + i64::from(n) <= 0 {
         return Err(format!("M̄_({g},{n}) 不稳定"));
     }
     // Hodge 丛秩为 g：λ_l = 0（l > g）；g = 0 时 ch_c = 0（c ≥ 1）
     if lambda.iter().any(|&(l, p)| p > 0 && l > g) {
-        return Ok(Q::ZERO);
+        return Ok(KlpRoute::Zero);
     }
     if g == 0 && ch.iter().any(|&(c, p)| p > 0 && c > 0) {
-        return Ok(Q::ZERO);
+        return Ok(KlpRoute::Zero);
     }
     if kappa.is_empty() && ch.is_empty() {
-        return Ok(psi::integrate(g, n, psi, lambda));
+        return Ok(KlpRoute::Pure);
     }
     if kappa.iter().any(|&(i, _)| i == 0) {
         return Err("κ_0 无定义".into());
@@ -499,22 +665,275 @@ pub fn klp(
         .sum::<u64>()
         + psi.iter().map(|&(_, p)| u64::from(p)).sum::<u64>();
     if weight as i64 != 3 * i64::from(g) - 3 + i64::from(n) {
-        return Ok(Q::ZERO);
+        return Ok(KlpRoute::Zero);
     }
     for &(c, _) in ch {
         if c % 2 == 0 {
             return Err(format!("ch_{c} 无定义（Hodge 丛只用奇数次 ch）"));
         }
         if u64::from(c) >= 2 * u64::from(g) {
-            return Ok(Q::ZERO);
+            return Ok(KlpRoute::Zero);
         }
     }
-    Ok(psi::integrate_mixed(g, n, kappa, psi, lambda, ch))
+    Ok(KlpRoute::Mixed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_source::{ResultSource, with_optional_registry, with_registry};
+
+    #[test]
+    fn int_class_non_top_legal_roots_persist_zero_without_duplicate_completions() {
+        use crate::cache_source::storage::Storage;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
+        struct Database(PathBuf);
+        impl Drop for Database {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut path = self.0.as_os_str().to_os_string();
+                    path.push(suffix);
+                    let _ = std::fs::remove_file(PathBuf::from(path));
+                }
+            }
+        }
+        let database = Database(std::env::temp_dir().join(format!(
+            "sc-faber-ic-nontop-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let registry = Arc::new(Registry::new());
+        with_registry(registry.clone(), || {
+            assert_eq!(
+                int_class(2, 2, &[(1, 2)], &[(1, 1)], &[(1, 1)]).unwrap(),
+                Q::ZERO
+            );
+            assert_eq!(
+                int_class(
+                    2,
+                    2,
+                    &[(1, 1), (1, 1)],
+                    &[(1, 0), (1, 1)],
+                    &[(1, 0), (1, 1)]
+                )
+                .unwrap(),
+                Q::ZERO
+            );
+            assert_eq!(int_class(1, 2, &[(1, 1)], &[], &[]).unwrap(), Q::ZERO);
+            // KLP and the fundamental-monomial API share this same root key.
+            assert_eq!(klp(1, 2, &[(1, 1)], &[], &[], &[]).unwrap(), Q::ZERO);
+            assert_eq!(
+                crate::int::int_fund_monomial(1, 2, &[(1, 1)], &[]).unwrap(),
+                Q::ZERO
+            );
+            assert_eq!(int_class(0, 5, &[], &[], &[(1, 1)]).unwrap(), Q::ZERO);
+        });
+        let expected = [
+            IntegralKey::Integral {
+                g: 2,
+                n: 2,
+                kappa: vec![(1, 2)],
+                psi: vec![(1, 1)],
+                lambda: vec![],
+                ch: vec![(1, 1)],
+            },
+            IntegralKey::Integral {
+                g: 1,
+                n: 2,
+                kappa: vec![(1, 1)],
+                psi: vec![],
+                lambda: vec![],
+                ch: vec![],
+            },
+            IntegralKey::Integral {
+                g: 0,
+                n: 5,
+                kappa: vec![],
+                psi: vec![],
+                lambda: vec![],
+                ch: vec![(1, 1)],
+            },
+        ];
+        let sources = registry.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].ready(), expected.len());
+        let rows = sources[0].pull(0, usize::MAX).unwrap().rows;
+        for (row, key) in rows.iter().zip(&expected) {
+            assert_eq!(&row.key, key);
+            assert_eq!(row.value, Q::ZERO);
+        }
+        let storage = Storage::open(database.0.to_str().unwrap(), registry).unwrap();
+        assert_eq!(storage.close().unwrap().rows, expected.len());
+        let reopened =
+            Storage::open(database.0.to_str().unwrap(), Arc::new(Registry::new())).unwrap();
+        for key in expected {
+            assert_eq!(reopened.get(key).unwrap(), Some(Q::ZERO));
+        }
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn int_class_non_top_zero_precedence_does_not_publish_invalid_roots() {
+        let registry = Arc::new(Registry::new());
+        with_registry(registry.clone(), || {
+            // These historically return zero before the top-degree path's
+            // parameter checks. They must keep that behavior without caching
+            // invalid input as a stable mathematical integral.
+            assert_eq!(int_class(1, 0, &[], &[], &[(1, 1)]).unwrap(), Q::ZERO);
+            assert_eq!(int_class(2, 1, &[(0, 1)], &[], &[]).unwrap(), Q::ZERO);
+            assert_eq!(int_class(2, 1, &[], &[(2, 1)], &[]).unwrap(), Q::ZERO);
+            assert_eq!(int_class(2, 1, &[], &[(0, 1)], &[]).unwrap(), Q::ZERO);
+            assert_eq!(int_class(2, 1, &[], &[], &[(2, 1)]).unwrap(), Q::ZERO);
+            assert_eq!(int_class(2, 1, &[], &[], &[(0, 1)]).unwrap(), Q::ZERO);
+            assert!(registry.sources().is_empty());
+            // Reaching top degree still follows the original error path.
+            assert!(
+                int_class(2, 1, &[(0, 1)], &[(1, 4)], &[])
+                    .unwrap_err()
+                    .contains("κ_0")
+            );
+            assert!(
+                int_class(2, 1, &[], &[(1, 2)], &[(2, 1)])
+                    .unwrap_err()
+                    .contains("ch_2")
+            );
+            assert!(registry.sources().iter().all(|source| source.ready() == 0));
+        });
+    }
+
+    #[test]
+    fn ic_cache_context_owns_the_only_ic_memo_and_preserves_raw_key_boundaries() {
+        let expected = with_optional_registry(None, || {
+            IC_MEMO.with(|memo| memo.borrow_mut().clear());
+            let value = int_class(2, 2, &[], &[(1, 2)], &[(1, 3)]).unwrap();
+            IC_MEMO.with(|memo| memo.borrow_mut().clear());
+            value
+        });
+        assert_eq!(expected, Q::from_signeds(1, 1440));
+        let first = Arc::new(Registry::new());
+        let key = (2, 2, vec![], vec![(1, 2)], vec![(1, 3)]);
+        with_registry(first.clone(), || {
+            assert_eq!(
+                int_class(2, 2, &[], &[(1, 2)], &[(1, 3)]).unwrap(),
+                expected
+            );
+            let source = ic_source(&first);
+            assert_eq!(source.get(&key), Some(expected.clone()));
+            let ready = source.ready();
+            assert_eq!(
+                int_class(2, 2, &[], &[(1, 1), (1, 1)], &[(1, 1), (1, 2)]).unwrap(),
+                expected,
+            );
+            assert_eq!(source.ready(), ready);
+            assert!(IC_MEMO.with(|memo| memo.borrow().is_empty()));
+            let root = source
+                .pull(0, usize::MAX)
+                .unwrap()
+                .rows
+                .into_iter()
+                .find(|row| {
+                    row.key
+                        == IntegralKey::Legacy {
+                            kind: "ic".to_owned(),
+                            nums: ic_nums(&key),
+                        }
+                })
+                .unwrap();
+            assert_eq!(root.value, expected);
+            assert_eq!(ic_nums(&key), [2, 2, 0, 2, 2, 1, 2, 1, 3]);
+        });
+        let second = Arc::new(Registry::new());
+        with_registry(second.clone(), || {
+            assert_eq!(
+                int_class(2, 2, &[], &[(1, 2)], &[(1, 3)]).unwrap(),
+                expected
+            );
+            assert!(IC_MEMO.with(|memo| memo.borrow().is_empty()));
+        });
+        assert!(!Arc::ptr_eq(&ic_source(&first), &ic_source(&second)));
+        first.fail("test IC storage failure".to_owned());
+        with_registry(first, || {
+            assert_eq!(
+                int_class(2, 2, &[], &[(1, 2)], &[(1, 3)]).unwrap_err(),
+                "test IC storage failure",
+            );
+        });
+    }
+
+    #[test]
+    fn ic_history_hit_is_loaded_into_its_mathematical_source() {
+        use crate::cache_source::storage::Storage;
+
+        let registry = Arc::new(Registry::new());
+        let persisted = Arc::new(LegacySource::new("ic", ic_nums));
+        let key = (2, 2, vec![], vec![(1, 2)], vec![(1, 3)]);
+        let expected = Q::from_signeds(1, 1440);
+        persisted.insert(key.clone(), &expected);
+        registry.register(persisted);
+        let storage = Storage::open(":memory:", registry.clone()).unwrap();
+        registry.bind_storage(storage.handle());
+        storage.flush().unwrap();
+        // Simulate an already populated backend with no IC source in this
+        // calling context; production sets this flag only when opening a DB.
+        registry.set_history(true);
+        with_registry(registry.clone(), || {
+            assert_eq!(
+                int_class(2, 2, &[], &[(1, 2)], &[(1, 3)]).unwrap(),
+                expected
+            );
+            let source = ic_source(&registry);
+            assert_eq!(source.get(&key), Some(expected));
+            // A recomputation would also complete recursive IC states.
+            assert_eq!(source.ready(), 1);
+        });
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn root_cache_cannot_bypass_klp_input_errors() {
+        let registry = Arc::new(Registry::new());
+        // Other internal APIs can publish a root before klp sees it. Even a
+        // cached zero must not convert a rejected public input into Ok(zero).
+        for (g, n, kappa, psi, ch) in [
+            (2, 1, vec![(0, 1)], vec![(1, 4)], vec![]),
+            (2, 1, vec![], vec![(1, 2)], vec![(2, 1)]),
+            (1, 0, vec![], vec![], vec![]),
+            (2, 1, vec![], vec![(2, 4)], vec![]),
+        ] {
+            root_source::with_registry(registry.clone(), g, n, &kappa, &psi, &[], &ch, || {
+                Ok(Q::ZERO)
+            })
+            .unwrap();
+            with_registry(registry.clone(), || {
+                assert!(klp(g, n, &kappa, &psi, &[], &ch).is_err());
+            });
+        }
+    }
+
+    #[test]
+    fn klp_route_preserves_existing_zero_and_error_precedence() {
+        for registry in [None, Some(Arc::new(Registry::new()))] {
+            with_optional_registry(registry, || {
+                // Rank and g=0 Hodge vanishing precede kappa/ch validation.
+                assert_eq!(
+                    klp(2, 1, &[(0, 1)], &[], &[(3, 1)], &[(2, 1)]).unwrap(),
+                    Q::ZERO
+                );
+                assert_eq!(klp(0, 4, &[(0, 1)], &[], &[], &[(2, 1)]).unwrap(), Q::ZERO);
+                // Kappa zero is checked before weight; even ch after weight.
+                assert!(klp(2, 1, &[(0, 1)], &[], &[], &[]).is_err());
+                assert_eq!(klp(2, 1, &[], &[], &[], &[(2, 1)]).unwrap(), Q::ZERO);
+                assert!(klp(2, 1, &[], &[(1, 2)], &[], &[(2, 1)]).is_err());
+                // The first vanishing odd ch wins before a later even ch.
+                assert_eq!(
+                    klp(1, 7, &[], &[], &[], &[(3, 1), (4, 1)]).unwrap(),
+                    Q::ZERO
+                );
+            });
+        }
+    }
 
     #[test]
     fn zero_powers_and_duplicate_factors() {

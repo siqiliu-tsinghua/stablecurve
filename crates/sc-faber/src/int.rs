@@ -29,6 +29,12 @@ pub fn int_fund(g: u32, n: u32, p: &KappaPsiPolynomial) -> Result<Q, String> {
             }
         }
         if t.weight() as i64 != top {
+            crate::hodge::root_source::complete_fund_zero(
+                g,
+                n,
+                t.kappa.first().map_or(&[], Vec::as_slice),
+                &t.psi,
+            )?;
             continue; // 非顶权 → 0
         }
         let psilist: Vec<u32> = (1..=n).map(|l| t.psi_power_at(l)).collect();
@@ -63,6 +69,125 @@ pub fn int_fund_monomial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legal_non_top_roots_are_canonical_unique_and_persist_exact_zero() {
+        use crate::cache_source::{IntegralKey, Registry, storage::Storage, with_registry};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
+        struct Database(PathBuf);
+        impl Drop for Database {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut path = self.0.as_os_str().to_os_string();
+                    path.push(suffix);
+                    let _ = std::fs::remove_file(PathBuf::from(path));
+                }
+            }
+        }
+        let database = Database(std::env::temp_dir().join(format!(
+            "sc-faber-fund-zero-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        )));
+        let registry = Arc::new(Registry::new());
+        with_registry(registry.clone(), || {
+            assert_eq!(int_fund_monomial(1, 2, &[(1, 1)], &[]).unwrap(), Q::ZERO);
+            let polynomial = KappaPsiPolynomial::new(vec![KpTerm {
+                kappa: vec![vec![1]],
+                psi: vec![],
+                coeff: Q::from_signeds(7, 13),
+            }]);
+            assert_eq!(int_fund(1, 2, &polynomial).unwrap(), Q::ZERO);
+            // κ0 retains int_fund's established semantics, including zero cases.
+            assert_eq!(int_fund_monomial(1, 2, &[(0, 1)], &[]).unwrap(), Q::ZERO);
+            assert_eq!(
+                int_fund_monomial(2, 2, &[(2, 1), (1, 2)], &[]).unwrap(),
+                Q::ZERO
+            );
+            let reordered = KappaPsiPolynomial::new(vec![KpTerm {
+                kappa: vec![vec![2, 1, 1]],
+                psi: vec![],
+                coeff: Q::from(-4),
+            }]);
+            assert_eq!(int_fund(2, 2, &reordered).unwrap(), Q::ZERO);
+            assert_eq!(
+                int_fund_monomial(2, 2, &[], &[(2, 1), (1, 1), (1, 1)]).unwrap(),
+                Q::ZERO
+            );
+        });
+        let root = |g, n, kappa, psi| IntegralKey::Integral {
+            g,
+            n,
+            kappa,
+            psi,
+            lambda: vec![],
+            ch: vec![],
+        };
+        let expected = [
+            root(1, 2, vec![(1, 1)], vec![]),
+            root(1, 2, vec![(0, 1)], vec![]),
+            root(2, 2, vec![(1, 2), (2, 1)], vec![]),
+            root(2, 2, vec![], vec![(1, 2), (2, 1)]),
+        ];
+        let sources = registry.sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].ready(), expected.len());
+        let rows = sources[0].pull(0, usize::MAX).unwrap().rows;
+        assert_eq!(rows.len(), expected.len());
+        for (row, key) in rows.iter().zip(&expected) {
+            assert_eq!(&row.key, key);
+            assert_eq!(row.value, Q::ZERO);
+        }
+        let storage = Storage::open(database.0.to_str().unwrap(), registry).unwrap();
+        assert_eq!(storage.close().unwrap().rows, expected.len());
+        let reopened =
+            Storage::open(database.0.to_str().unwrap(), Arc::new(Registry::new())).unwrap();
+        for key in expected {
+            assert_eq!(reopened.get(key).unwrap(), Some(Q::ZERO));
+        }
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn non_top_caching_keeps_original_validation_and_zero_power_order() {
+        use crate::cache_source::{Registry, with_registry};
+        use std::sync::Arc;
+        let registry = Arc::new(Registry::new());
+        let invalid = KappaPsiPolynomial {
+            terms: vec![KpTerm {
+                kappa: vec![vec![], vec![]],
+                psi: vec![(0, 0)],
+                coeff: Q::ONE,
+            }],
+        };
+        with_registry(registry.clone(), || {
+            assert!(int_fund(0, 2, &invalid).unwrap_err().contains("不稳定"));
+            assert!(int_fund(0, 4, &invalid).unwrap_err().contains("单顶点"));
+            let invalid_leg = KappaPsiPolynomial {
+                terms: vec![KpTerm {
+                    kappa: vec![vec![]],
+                    psi: vec![(0, 0)],
+                    coeff: Q::ONE,
+                }],
+            };
+            assert!(int_fund(0, 4, &invalid_leg).unwrap_err().contains("腿 0"));
+            assert!(registry.sources().is_empty());
+            // The convenience constructor historically removes zero powers
+            // before int_fund sees or validates their leg numbers.
+            assert_eq!(int_fund_monomial(0, 4, &[], &[(0, 0)]).unwrap(), Q::ZERO);
+            assert_eq!(
+                registry
+                    .sources()
+                    .iter()
+                    .map(|source| source.ready())
+                    .sum::<usize>(),
+                1
+            );
+        });
+    }
 
     #[test]
     fn g0_kappa_psi_values() {

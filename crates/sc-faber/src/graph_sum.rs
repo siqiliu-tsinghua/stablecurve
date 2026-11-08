@@ -61,42 +61,87 @@ fn integrate_with_threads(
 ) -> Result<Q, String> {
     let layers: Vec<_> = (0..=d).map(|c| crate::generators::layer(g, n, c)).collect();
     let graphs: Vec<_> = layers.iter().flat_map(|layer| layer.iter()).collect();
-    if graphs.len() < 8 {
-        // 少量图不建立外层并行区，让昂贵的单顶点后代查询自行并行。
-        let mut pairing = Pairing::new(kappa, psi);
-        let mut total = Q::ZERO;
-        for graph in graphs {
-            visit(graph, &mut |graph, poly| {
-                total += pairing.evaluate(graph, &poly)?;
-                Ok(())
-            })?;
-        }
-        return Ok(total);
-    }
-    // 小块动态领取，避免图的圈秩、装饰数差异导致静态切分失衡。
-    sc_num::parallel::chunks(
-        graphs.len(),
-        1,
-        threads,
-        || Pairing::new(kappa, psi),
-        |pairing, range| {
+    crate::cache_source::with_inherited_registry(|context| {
+        if graphs.len() < 8 {
+            // 少量图不建立外层并行区，让昂贵的单顶点后代查询自行并行。
+            let mut pairing = Pairing::new(kappa, psi);
             let mut total = Q::ZERO;
-            for i in range {
-                visit(graphs[i], &mut |graph, poly| {
+            for graph in graphs {
+                visit(graph, &mut |graph, poly| {
                     total += pairing.evaluate(graph, &poly)?;
                     Ok(())
                 })?;
             }
-            Ok(total)
-        },
-    )
-    .into_iter()
-    .try_fold(Q::ZERO, |sum, part: Result<Q, String>| Ok(sum + part?))
+            return Ok(total);
+        }
+        // 小块动态领取，避免图的圈秩、装饰数差异导致静态切分失衡。
+        sc_num::parallel::chunks(
+            graphs.len(),
+            1,
+            threads,
+            || Pairing::new(kappa, psi),
+            |pairing, range| {
+                context.run(|| {
+                    let mut total = Q::ZERO;
+                    for i in range {
+                        visit(graphs[i], &mut |graph, poly| {
+                            total += pairing.evaluate(graph, &poly)?;
+                            Ok(())
+                        })?;
+                    }
+                    Ok(total)
+                })
+            },
+        )
+        .into_iter()
+        .try_fold(Q::ZERO, |sum, part: Result<Q, String>| Ok(sum + part?))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_pool_inherits_the_callers_owner_for_real_socle_results() {
+        assert!(
+            (0..=4)
+                .map(|c| crate::generators::layer(2, 1, c).len())
+                .sum::<usize>()
+                >= 8
+        );
+        let registry = std::sync::Arc::new(crate::cache_source::Registry::new());
+        let first_visits = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        let visit = |graph: &StableGraph, emit: &mut Emit<'_>| {
+            if first_visits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                barrier.wait();
+            }
+            assert_eq!(
+                crate::cache_source::current_registry().unwrap().id(),
+                registry.id()
+            );
+            crate::generators::visit_monomials(
+                graph,
+                4 - graph.codim(),
+                false,
+                Some(&[]),
+                &mut |poly| emit(graph, poly),
+            )
+        };
+        let actual = crate::cache_source::with_registry(registry.clone(), || {
+            integrate_with_threads(2, 1, 4, &[], &[], &visit, 4)
+        })
+        .unwrap();
+        assert_ne!(actual, Q::ZERO);
+        assert!(first_visits.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+        assert!(
+            registry
+                .sources()
+                .iter()
+                .any(|source| source.ready() > source.floor())
+        );
+    }
 
     #[test]
     fn graph_workers_match_serial_pairing_and_propagate_errors() {

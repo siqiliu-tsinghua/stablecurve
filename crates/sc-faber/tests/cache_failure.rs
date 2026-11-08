@@ -1,7 +1,7 @@
 //! 持久缓存写入失败须可见：卸下 L2（`cache_attached` 变为 false），不静默
 //! 吞掉错误。L2 是进程全局的，故单独成一个测试二进制。
 
-use sc_faber::socle::{attach_cache, cache_attached, cache_put};
+use sc_faber::socle::{attach_cache, cache_attached, cache_put, close_cache, flush_cache};
 
 #[test]
 fn failed_write_detaches_cache() {
@@ -14,9 +14,11 @@ fn failed_write_detaches_cache() {
     // 另一个连接删表，模拟库被破坏
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute("DROP TABLE st", [])
+        .execute("DROP TABLE faber_integrals", [])
         .unwrap();
     cache_put("st", &[1, 2, 3], &sc_faber::Q::from(1));
+    assert!(flush_cache().is_err());
     assert!(!cache_attached());
+    assert!(close_cache().is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

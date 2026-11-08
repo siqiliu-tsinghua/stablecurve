@@ -81,10 +81,10 @@ def test_clear_graph_cache(f):
     assert f.dr(2, [1, 1, -2], r=2, kappa=[(1, 1)], psi=[(1, 3)]) == v == Fraction(13, 144)
 
 
-def test_cache_is_process_global(tmp_path):
+def test_cache_is_instance_local(tmp_path):
     c = tmp_path / "g.sqlite"
     a = FABER(cache=str(c))
     assert a.cache_attached
     b = FABER(cache="")
     assert not b.cache_attached
-    assert not a.cache_attached  # L2 为进程全局，b 已将其卸下
+    assert a.cache_attached
