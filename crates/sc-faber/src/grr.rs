@@ -385,8 +385,8 @@ fn todd_inv_exp_graphs(a: &[ATriple], t1: u32, tvect: &[u32], g: u32, n: u32) ->
     let scomp: Vec<u32> = (1..=n).filter(|x| !atn[l - 1].1.contains(x)).collect();
     for h in atn[l - 1].0..=g {
         for s in powerset_sorted(&scomp) {
-            let strictly = !(h == atn[l - 1].0 && s.is_empty())
-                && !(h == g && (n as i64 - atn[l - 1].1.len() as i64 - s.len() as i64) < 2);
+            let strictly = !(h == atn[l - 1].0 && s.is_empty()
+                || h == g && (n as i64 - atn[l - 1].1.len() as i64 - s.len() as i64) < 2);
             if strictly {
                 let mid_extra = vec![n + 2 * l as u32, n + 2 * l as u32 + 1];
                 let fin_extra = vec![n + 2 * l as u32 + 2];

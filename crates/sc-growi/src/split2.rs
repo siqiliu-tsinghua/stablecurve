@@ -200,19 +200,19 @@ pub(crate) fn split2_sum(
         // 度可行界（三分支直译）
         let (d1, d2) = {
             let dm_full = iv.dim as i32 + 2 - iv.deg as i32;
-            if dm_full > 0 {
-                (
+            match dm_full.cmp(&0) {
+                std::cmp::Ordering::Greater => (
                     idiv(iv.dim as i32 - iv.deg as i32 - dw, dm_full).max(0),
                     idiv(iv.dim as i32 - 1 - dw, dm_full).min(d as i32),
-                )
-            } else if dm_full < 0 {
-                let dm = iv.deg as i32 - iv.dim as i32 - 2;
-                (
-                    idiv(dw - 2 * iv.dim as i32 + iv.deg as i32 - 2, dm).max(0),
-                    idiv(1 + dw, dm).min(d as i32),
-                )
-            } else {
-                (0, d as i32)
+                ),
+                std::cmp::Ordering::Less => {
+                    let dm = iv.deg as i32 - iv.dim as i32 - 2;
+                    (
+                        idiv(dw - 2 * iv.dim as i32 + iv.deg as i32 - 2, dm).max(0),
+                        idiv(1 + dw, dm).min(d as i32),
+                    )
+                }
+                std::cmp::Ordering::Equal => (0, d as i32),
             }
         };
 

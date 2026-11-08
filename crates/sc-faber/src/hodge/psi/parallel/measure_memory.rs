@@ -4,7 +4,6 @@
 //! allocator). They do not attribute memory to individual Rust containers.
 //! Native peak counters cover the entire process lifetime; phase summaries below
 //! instead take maxima of the current counters sampled during that phase.
-#![cfg(test)]
 #![allow(dead_code)]
 
 use std::io;

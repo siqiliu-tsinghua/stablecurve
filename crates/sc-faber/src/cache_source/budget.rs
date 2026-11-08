@@ -54,10 +54,12 @@ pub(crate) struct MemorySnapshot {
     pub(crate) cgroup_headroom_bytes: Option<u64>,
     pub(crate) cgroup_limit_bytes: Option<u64>,
     pub(crate) job_process_limit_bytes: Option<u64>,
+    #[cfg(any(target_os = "windows", test))]
     pub(crate) job_memory_limit_bytes: Option<u64>,
     pub(crate) job_headroom_bytes: Option<u64>,
     /// Job peak usage is an upper bound on current usage. The resulting
     /// headroom is conservative and may remain small after an earlier peak.
+    #[cfg(any(target_os = "windows", test))]
     pub(crate) job_headroom_peak_based: bool,
     /// Whether this backend's documented environment checks completed; this is
     /// not a claim that every OS quota is observable (see module limitations).
@@ -79,8 +81,10 @@ impl MemorySnapshot {
             cgroup_headroom_bytes: None,
             cgroup_limit_bytes: None,
             job_process_limit_bytes: None,
+            #[cfg(any(target_os = "windows", test))]
             job_memory_limit_bytes: None,
             job_headroom_bytes: None,
+            #[cfg(any(target_os = "windows", test))]
             job_headroom_peak_based: false,
             environment_limits_checked: false,
         }
@@ -1233,12 +1237,28 @@ mod platform {
     }
 
     fn group_directory(group: &Path, root: &Path, mount: &Path) -> Option<PathBuf> {
-        if group.components().any(|part| part == Component::ParentDir) || !mount.is_absolute() {
+        if !group.is_absolute()
+            || !root.is_absolute()
+            || !mount.is_absolute()
+            || mount.components().any(|part| part == Component::ParentDir)
+        {
             return None;
         }
         if let Ok(relative) = group.strip_prefix(root) {
+            // Both proc paths are relative to the cgroup namespace root, so
+            // leading `..` components are valid (e.g. Colab's /../../...).
+            // Remove the mount's root first; only the remaining suffix must
+            // stay inside the mounted hierarchy.
+            if relative
+                .components()
+                .any(|part| part == Component::ParentDir)
+            {
+                return None;
+            }
             Some(mount.join(relative))
-        } else if group == Path::new("/") {
+        } else if group == Path::new("/")
+            && !root.components().any(|part| part == Component::ParentDir)
+        {
             // A cgroup namespace can expose its current group as root while
             // mountinfo still names the host-side subtree root.
             Some(mount.to_path_buf())
@@ -1302,6 +1322,10 @@ mod platform {
         let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
             return CgroupMemory::default();
         };
+        cgroup_memory_from_proc(&membership, &mountinfo)
+    }
+
+    fn cgroup_memory_from_proc(membership: &str, mountinfo: &str) -> CgroupMemory {
         let mut result = CgroupMemory {
             checked: true,
             ..CgroupMemory::default()
@@ -1375,6 +1399,144 @@ mod platform {
             Some(PathBuf::from("/cg/job"))
         );
         assert!(group_directory(Path::new("/../job"), Path::new("/"), Path::new("/cg")).is_none());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cgroup_namespace_parents_are_resolved_before_mount_containment_checks() {
+        let mount = Path::new("/cg");
+        assert_eq!(
+            group_directory(
+                Path::new("/../../jupyter-children"),
+                Path::new("/../.."),
+                mount
+            ),
+            Some(mount.join("jupyter-children"))
+        );
+        assert_eq!(
+            group_directory(Path::new("/../.."), Path::new("/../.."), mount),
+            Some(mount.to_path_buf())
+        );
+        for (group, root) in [
+            ("/../outside", "/"),
+            ("/../../parent2/job", "/../../parent"),
+            ("/../../parent/../outside", "/../../parent"),
+            ("/", "/.."),
+            ("relative/job", "/"),
+            ("/job", "relative"),
+        ] {
+            assert!(group_directory(Path::new(group), Path::new(root), mount).is_none());
+        }
+        assert!(group_directory(Path::new("/job"), Path::new("/"), Path::new("/cg/..")).is_none());
+    }
+
+    #[cfg(test)]
+    struct TestHierarchy(PathBuf);
+
+    #[cfg(test)]
+    impl Drop for TestHierarchy {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_hierarchy() -> TestHierarchy {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        TestHierarchy(
+            std::env::temp_dir().join(format!("sc-faber-cgroup-{}-{stamp}", std::process::id())),
+        )
+    }
+
+    #[cfg(test)]
+    fn mount_field(path: &Path) -> String {
+        path.to_str()
+            .unwrap()
+            .replace('\\', "\\134")
+            .replace(' ', "\\040")
+            .replace('\t', "\\011")
+            .replace('\n', "\\012")
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cgroup_namespace_parent_paths_still_enforce_visible_ancestor_limits() {
+        let hierarchy = test_hierarchy();
+        let mount = &hierarchy.0;
+        let child = mount.join("jupyter-children");
+        fs::create_dir_all(&child).unwrap();
+        let mount_field = mount_field(mount);
+        for (membership, filesystem, options, limit_file, usage_file) in [
+            (
+                "0::/../../jupyter-children\n",
+                "cgroup2",
+                "rw",
+                "memory.max",
+                "memory.current",
+            ),
+            (
+                "5:cpu,memory:/../../jupyter-children\n",
+                "cgroup",
+                "rw,cpu,memory",
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            ),
+        ] {
+            fs::write(mount.join(limit_file), "90\n").unwrap();
+            fs::write(mount.join(usage_file), "80\n").unwrap();
+            fs::write(child.join(limit_file), "100\n").unwrap();
+            fs::write(child.join(usage_file), "20\n").unwrap();
+            let mountinfo =
+                format!("42 21 0:42 /../.. {mount_field} rw - {filesystem} cgroup {options}\n");
+            let observed = cgroup_memory_from_proc(membership, &mountinfo);
+            assert!(observed.checked);
+            assert_eq!(observed.limit, Some(90));
+            assert_eq!(observed.headroom, Some(10));
+
+            fs::write(child.join(limit_file), "invalid\n").unwrap();
+            assert!(!cgroup_memory_from_proc(membership, &mountinfo).checked);
+            let outside = membership.replace("/../../jupyter-children", "/../../../outside");
+            assert!(!cgroup_memory_from_proc(&outside, &mountinfo).checked);
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn colab_dual_mounts_resolve_the_current_group_without_unrelated_limits() {
+        let hierarchy = test_hierarchy();
+        let unrelated = hierarchy.0.join("sys/fs/cgroup");
+        let current = hierarchy.0.join("var/colab/cgroup/jupyter-children");
+        for (directory, limit, used) in [(&unrelated, "10\n", "9\n"), (&current, "100\n", "30\n")] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("memory.max"), limit).unwrap();
+            fs::write(directory.join("memory.current"), used).unwrap();
+        }
+        let unrelated_line = format!(
+            "936 935 0:27 / {} ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot\n",
+            mount_field(&unrelated)
+        );
+        let current_line = format!(
+            "945 940 0:27 /../../jupyter-children {} ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n",
+            mount_field(&current)
+        );
+        let membership = "0::/../../jupyter-children\n";
+        assert!(!cgroup_memory_from_proc(membership, &unrelated_line).checked);
+        for mountinfo in [
+            format!("{unrelated_line}{current_line}"),
+            format!("{current_line}{unrelated_line}"),
+        ] {
+            let observed = cgroup_memory_from_proc(membership, &mountinfo);
+            assert!(observed.checked);
+            assert_eq!(observed.limit, Some(100));
+            assert_eq!(observed.headroom, Some(70));
+        }
+
+        fs::write(current.join("memory.max"), "invalid\n").unwrap();
+        let mountinfo = format!("{unrelated_line}{current_line}");
+        assert!(!cgroup_memory_from_proc(membership, &mountinfo).checked);
     }
 }
 
@@ -1702,6 +1864,7 @@ mod tests {
         observation.job_headroom_peak_based = true;
         budget.publish_snapshot(observation);
         assert_eq!(budget.check(0).limits.unwrap().hard_bytes, 400);
+        assert_eq!(budget.check(0).memory.job_memory_limit_bytes, Some(5000));
         assert!(budget.check(0).memory.job_headroom_peak_based);
     }
 

@@ -103,7 +103,7 @@ fn run(q: &Query) -> Result<String, String> {
                 let mask =
                     u64::try_from(mask).map_err(|_| format!("grr 的 s_mask={mask} 须为非负"))?;
                 let s: Vec<u32> = (0..64)
-                    .filter(|i| mask >> i & 1 == 1)
+                    .filter(|i| (mask >> i) & 1 == 1)
                     .map(|i| i + 1)
                     .collect();
                 a.push((h, s, v));
