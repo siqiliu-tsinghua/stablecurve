@@ -131,11 +131,22 @@ Examples:
 
 ### 2.2 Python
 
+`klp` first applies exact Hodge formulas and Mumford relations. In particular,
+the unmarked integrals of `lambda_g lambda_(g-1) lambda_(g-2)` and
+`lambda_(g-1)^3` use Faber--Pandharipande's closed formulas without a descendant
+work graph. The general `lambda_g lambda_(g-1)` family also supports mixed
+kappa/psi/ch insertions; marked factors are pushed forward before using the
+unmarked formula. Repeated lambda factors undergo bounded symbolic reduction;
+remaining terms share one GRR calculation. If expansion would be too costly,
+the original evaluator is used. Existing single-ch lambda_1/lambda_2 paths are
+preserved when reduction cannot resolve every term by a closed formula.
+
 ```python
 from sc_faber import FABER
 f = FABER()                                  # two-level cache at ~/.faber/cache.sqlite
 f.klp(2, 2, psi=[(1,2)], lam=[(1,3)])        # Fraction(1, 1440)
 f.klp(7, 0, lam=[(1,18)])                    # Fraction(32017001, 638512875)
+f.klp(20, 0, lam=[(18,1), (19,1), (20,1)])  # direct closed formula
 f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 ```
 
@@ -151,6 +162,28 @@ them.
 
 Note: the pyo3 layer currently exposes `klp`/`dr`; use the CLI for the
 remaining ops.
+
+### 2.3 Rust batch Hodge integrals
+
+`hodge::lambda_integrals(g, callback)` visits every pure lambda monomial of
+degree `3g-3`, including zeros, in descending partition order. The callback
+receives a lambda-index list and an exact rational; the return value is the
+number of visited monomials. `hodge::lambda_monomial_count(g)` gives that count
+without evaluating integrals. These functions require `g >= 2`.
+
+```rust
+let total = sc_faber::hodge::lambda_integrals(4, |indices, value| {
+    println!("{indices:?}: {value}");
+    Ok(())
+})?;
+assert_eq!(total, 18);
+```
+
+The batch reuses earlier answers via Mumford relations; unresolved cases use
+`klp`. Wrap it in `CacheSession::run` to persist results through the same cache
+as individual calls. Callback errors stop enumeration immediately. Per-genus
+reuse retains answers in memory until completion. See the full
+[hodge_data example](examples/hodge_data/README.md) for output and resume handling.
 
 ---
 

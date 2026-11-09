@@ -332,6 +332,26 @@ pub(crate) fn with_registry(
     with_registry_policy(registry, g, n, kappa, psi, lambda, ch, true, calculate)
 }
 
+/// Publish an already evaluated, validated pure-lambda batch answer. Derived
+/// roots need neither a historical read nor a nested public cache entry.
+pub(super) fn complete_lambda(g: u32, lambda: &[(u32, u32)], value: Q) -> Result<Q, String> {
+    crate::cache_source::with_current_registry(|registry| {
+        let Some(registry) = registry else {
+            return Ok(value);
+        };
+        registry.check_error()?;
+        let key = RootKey {
+            g,
+            n: 0,
+            kappa: Vec::new(),
+            psi: Vec::new(),
+            lambda: lambda.to_vec(),
+            ch: Vec::new(),
+        };
+        Ok(source(registry).insert(key, value, true))
+    })
+}
+
 /// An already validated, non-top fundamental monomial has the exact value
 /// zero. Keep it in the same primary mathematical root table as Socle/KLP;
 /// coefficient arithmetic and polynomial objects remain outside its identity.
@@ -622,6 +642,10 @@ mod tests {
         crate::cache_source::with_registry(registry.clone(), || {
             let expected = super::super::klp(2, 2, &[], &[(1, 2)], &[(1, 3)], &[]).unwrap();
             assert_eq!(expected, Q::from_signeds(1, 1440));
+            // Mumford reduction also publishes the independently evaluated
+            // lambda_1 lambda_2 leaf. An alias must add neither root again.
+            let completed = root_rows(&registry).len();
+            assert_eq!(completed, 2);
             assert_eq!(
                 super::super::klp(
                     2,
@@ -634,8 +658,8 @@ mod tests {
                 .unwrap(),
                 expected
             );
+            assert_eq!(root_rows(&registry).len(), completed);
         });
-        assert_eq!(root_rows(&registry).len(), 1);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! sources without opening SQLite; `pull` adds the C1 background consumer.
 //! `persist` uses a fresh temporary disk SQLite database unless
 //! SC_FABER_MEASURE_CACHE_PATH supplies a filesystem path. Provided paths are
-//! reported as non-cold and are never deleted. Automatic SQLite/WAL/SHM files
+//! reported as fresh only when absent and are never deleted. Automatic SQLite/WAL/SHM files
 //! are removed after a successful close; no other measurement files are made.
 //! Public-call times exclude attachment and printing. `durable_total_s` spans
 //! work (including its result printing) and flush (including its reporting).
@@ -22,6 +22,15 @@
 //! SC_FABER_MEASURE_RECOVERY_GENUS defaults to 15 and also accepts 12; both
 //! workloads have known exact reference values. Genus 12 can finish before
 //! the observer sees committed descendants, so it is only a short diagnostic.
+//! `measure_lambda_top_triple` computes lambda_g lambda_(g-1) lambda_(g-2)
+//! through public klp, including its algebraic shortcuts. It now measures the
+//! closed-form path, not general-GRR memory pressure. A separate exact-value
+//! check runs outside the timed call. Every supplied SQLite path must
+//! be absent before launch, so this workload cannot become a cached root hit.
+//! For general workloads, work_written_blocks and work_loaded_blocks confirm
+//! actual spill/readback; a formula-only triple should not create work blocks.
+//! SC_FABER_MEASURE_TIMEOUT_SECS optionally bounds each owned child, including
+//! flush/close. On timeout the child is terminated and its database retained.
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 use sc_faber::hodge::klp;
@@ -167,7 +176,7 @@ fn isolated(name: &str, threads: Option<u32>, work: impl FnOnce()) {
             println!(
                 "measurement_cache workload={name} source_mode={mode} path={} cache_state={}",
                 cache.path.display(),
-                if cache.automatic {
+                if cache.automatic || !cache.path.exists() {
                     "fresh"
                 } else {
                     "provided_non_cold"
@@ -286,7 +295,25 @@ fn isolated(name: &str, threads: Option<u32>, work: impl FnOnce()) {
             }
             _ => unreachable!(),
         }
-        let status = command.status().expect("start fresh measurement process");
+        let status = if std::env::var_os("SC_FABER_MEASURE_TIMEOUT_SECS").is_some() {
+            let timeout =
+                Duration::from_secs(u64::from(setting("SC_FABER_MEASURE_TIMEOUT_SECS", 1)));
+            let mut child = RecoveryChild {
+                child: command.spawn().expect("start bounded measurement process"),
+            };
+            loop {
+                if let Some(status) = child.child.try_wait().expect("poll bounded measurement") {
+                    break status;
+                }
+                assert!(
+                    start.elapsed() < timeout,
+                    "measurement child exceeded {timeout:?}; terminating owned child and retaining its cache"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            command.status().expect("start fresh measurement process")
+        };
         println!(
             "measurement_process workload={name} run={run} elapsed_s={:.9}",
             start.elapsed().as_secs_f64()
@@ -338,6 +365,59 @@ fn measure_lambda1_top() {
                 elapsed.as_secs_f64()
             );
         }
+    });
+}
+
+fn lambda_top_triple_reference(g: u32) -> Q {
+    assert!(g >= 2, "top lambda triples require genus at least two");
+    let twice_g = g.checked_mul(2).expect("Bernoulli index exceeds u32");
+    // Faber--Pandharipande, Hodge integrals and Gromov--Witten theory,
+    // Theorem 4 and Section 4.3: https://arxiv.org/abs/math/9810173.
+    // Adjacent even Bernoulli numbers have opposite signs.
+    -(sc_faber::socle::bernoulli(u64::from(twice_g))
+        * sc_faber::socle::bernoulli(u64::from(twice_g - 2)))
+        / (Q::from(2) * Q::from(twice_g) * Q::from(twice_g - 2) * sc_num::factorial(twice_g - 2))
+}
+
+#[test]
+fn lambda_top_triple_reference_has_independent_small_genus_anchors() {
+    for (g, expected) in [(2, "1/5760"), (3, "1/1451520"), (4, "1/87091200")] {
+        assert_eq!(lambda_top_triple_reference(g).to_string(), expected);
+    }
+}
+
+#[test]
+#[ignore = "manual cold public lambda triple, including the closed-form shortcut"]
+fn measure_lambda_top_triple() {
+    if source_mode() == "persist" {
+        if let Some(path) = std::env::var_os(CACHE_PATH) {
+            assert!(
+                !Path::new(&path).exists(),
+                "hard lambda triple requires a fresh SQLite path; refusing an existing cache"
+            );
+        }
+    }
+    isolated("measure_lambda_top_triple", None, || {
+        let g = setting("SC_FABER_MEASURE_GENUS", 12);
+        assert!(g >= 2, "top lambda triples require genus at least two");
+        // lambda_0 is the unit in genus two. No hodge_data formula/reduction
+        // participates in this computation; mathematical shortcuts belong to klp.
+        let lambda: Vec<_> = (g - 2..=g)
+            .filter(|&index| index != 0)
+            .map(|index| (index, 1))
+            .collect();
+        let start = Instant::now();
+        let value = klp(g, 0, &[], &[], &lambda, &[]).expect("top lambda triple");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            value,
+            lambda_top_triple_reference(g),
+            "lambda triple genus {g}"
+        );
+        println!(
+            "measurement_query workload=lambda_top_triple genus={g} elapsed_s={:.9} value={value} direct_klp=true exact_closed_formula_checked=true",
+            elapsed.as_secs_f64()
+        );
     });
 }
 

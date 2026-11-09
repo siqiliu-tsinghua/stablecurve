@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "examples/hodge_data"]
 
 [workspace.package]
 edition = "2024"

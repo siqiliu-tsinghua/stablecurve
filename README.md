@@ -15,6 +15,7 @@ common rational-number layer (`sc-num`):
 | `sc-num` | malachite rational wrapper (shared by all three engines) | — |
 
 - **Usage (CLI + Python)**: [USER_GUIDE.md](USER_GUIDE.md)
+- **Pure Rust example**: [all top-degree Hodge integrals](examples/hodge_data/README.md)
 - **Analysis & design**: [docs/GROWI_REDESIGN.md](docs/GROWI_REDESIGN.md),
   [docs/FABER_REDESIGN.md](docs/FABER_REDESIGN.md),
   [docs/GWALL_REDESIGN.md](docs/GWALL_REDESIGN.md)
@@ -67,6 +68,37 @@ and the growi↔faber cross-check. The complete g ≤ 14 comparison with
 admcycles is a one-off run of `tools/admcycles_hodge.py check --max-genus 14`
 (about an hour). v0.1.0 was tested manually before release on Windows 11, Debian 13
 (rustc 1.85.1) and macOS 26.7 (Intel).
+
+## Example: Hodge integral data
+
+[`examples/hodge_data`](examples/hodge_data/README.md) is a pure Rust program
+that enumerates all monomials in λ₁, …, λ_g of weighted degree 3g−3 and computes
+their integrals on M̄_g, including zeros, for 2 ≤ g ≤ 20. It calls `sc-faber`'s
+batch API, sharing Mumford relations, closed formulas and earlier answers.
+SQLite retains completed results and reusable intermediates for later runs.
+
+```bash
+cargo run --release -p hodge-data  # small demo: g=2..4
+```
+
+Each genus produces `target/hodge-data/hodge_data_gG.sage`. The example guide
+documents genus selection, threads, memory budgets, output paths and resuming.
+Generated data and SQLite caches are local outputs, separate from the source.
+
+The files use the same `hodge_number[(lambda indices)]` assignment format as
+[admcycles' precomputed Hodge table](https://gitlab.com/modulispaces/admcycles/-/blob/master/README.rst).
+In a **SageMath session**, load a file into a new or existing table:
+
+```python
+hodge_number = globals().get("hodge_number", {})
+load("target/hodge-data/hodge_data_g4.sage")
+hodge_number[(4, 3, 2)]  # 1/87091200
+```
+
+Keys list lambda indices in descending order, with repetitions; values are
+exact rationals. The table can be used alongside admcycles for lookup and
+further calculations. Loading it does not automatically populate admcycles'
+[`hodge_recursion` cache](https://gitlab.com/modulispaces/admcycles/-/blob/master/admcycles/hodge_recursion.py).
 
 ## License
 

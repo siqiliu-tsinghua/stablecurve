@@ -187,12 +187,30 @@ fn integrate_ch_roots(
     {
         return Q::ZERO;
     }
+    integrate_polynomial_roots(g, roots, lambda_polynomial(&factors, explicit_ch), threads)
+}
+
+fn lambda_polynomial(lambda: &[(u32, u32)], explicit_ch: &[(u32, u32)]) -> Vec<ChMono> {
     let mut poly = vec![(explicit_ch.to_vec(), Q::ONE)];
-    for (l, p) in factors {
+    for &(l, p) in lambda.iter().filter(|&&(l, p)| l > 0 && p > 0) {
         let expansion = lambda_expansion(l);
         for _ in 0..p {
             poly = collect_terms(ch_mul(&poly, &expansion));
         }
+    }
+    poly
+}
+
+// All lambda terms share these roots and a single descendant work graph.
+// Combine their ch coefficients before applying the common Bernoulli factors.
+fn integrate_polynomial_roots(
+    g: u32,
+    roots: &[(Vec<u32>, Q)],
+    mut poly: Vec<ChMono>,
+    threads: usize,
+) -> Q {
+    if poly.is_empty() || roots.is_empty() {
+        return Q::ZERO;
     }
     crate::cache_source::with_current_registry(|registry| {
         with_descendents(registry, |evaluator| {
@@ -354,6 +372,19 @@ fn integrate_mixed_with_threads(
     if kappa.is_empty() {
         return integrate_ch_with_threads(g, n, psi, lambda, ch, threads);
     }
+    let roots = kappa_psi_roots(n, kappa, psi);
+    integrate_ch_roots(g, &roots, lambda, ch, threads)
+}
+
+fn kappa_psi_roots(n: u32, kappa: &[(u32, u32)], psi: &[(u32, u32)]) -> Vec<(Vec<u32>, Q)> {
+    let mut descendants = vec![0; n as usize];
+    for &(leg, power) in psi {
+        descendants[leg as usize - 1] = power;
+    }
+    if kappa.is_empty() {
+        descendants.sort_unstable();
+        return vec![(descendants, Q::ONE)];
+    }
     let mut kappalist = Vec::new();
     for &(index, power) in kappa {
         kappalist.extend(std::iter::repeat_n(index, power as usize));
@@ -370,11 +401,7 @@ fn integrate_mixed_with_threads(
         };
         *roots.entry(powers).or_insert(Q::ZERO) += coefficient;
     }
-    let mut descendants = vec![0; n as usize];
-    for &(leg, power) in psi {
-        descendants[leg as usize - 1] = power;
-    }
-    let roots: Vec<_> = roots
+    roots
         .into_iter()
         .filter(|(_, c)| *c != Q::ZERO)
         .map(|(powers, c)| {
@@ -383,8 +410,172 @@ fn integrate_mixed_with_threads(
             d.sort_unstable();
             (d, c)
         })
-        .collect();
-    integrate_ch_roots(g, &roots, lambda, ch, threads)
+        .collect()
+}
+
+/// Accept a normal form only when its remaining GRR polynomial has no more
+/// roots than the original query. More lambda simplification can otherwise
+/// increase descendant planning, even after identical ch terms are combined.
+pub(super) enum ReducedIntegral {
+    Reduced(Q),
+    Original(Q),
+}
+
+pub(super) fn integrate_reduced(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    original_lambda: &[(u32, u32)],
+    lambda: &[(Vec<(u32, u32)>, Q)],
+    ch: &[(u32, u32)],
+) -> ReducedIntegral {
+    if lambda
+        .iter()
+        .all(|(_, coefficient)| *coefficient == Q::ZERO)
+    {
+        return ReducedIntegral::Reduced(Q::ZERO);
+    }
+    let original_poly = lambda_polynomial(original_lambda, ch);
+    if let Some((poly, top_coefficient)) =
+        lambda_sum_polynomial(g, lambda, ch, Some(original_poly.len()))
+    {
+        drop(original_poly);
+        ReducedIntegral::Reduced(integrate_lambda_polynomial(
+            g,
+            n,
+            kappa,
+            psi,
+            poly,
+            top_coefficient,
+            ch.is_empty(),
+        ))
+    } else {
+        // Reuse the original expansion instead of asking the caller to expand
+        // it again. This value already includes every closed leaf's share.
+        ReducedIntegral::Original(integrate_lambda_polynomial(
+            g,
+            n,
+            kappa,
+            psi,
+            original_poly,
+            Q::ZERO,
+            ch.is_empty(),
+        ))
+    }
+}
+
+// Keep root-count selection independent from roots, caches and GRR. Rejecting
+// a transient polynomial is conservative: later terms might cancel it, but
+// falling back to the original query remains mathematically exact.
+fn lambda_sum_polynomial(
+    g: u32,
+    lambda: &[(Vec<(u32, u32)>, Q)],
+    ch: &[(u32, u32)],
+    allowance: Option<usize>,
+) -> Option<(Vec<ChMono>, Q)> {
+    use std::collections::btree_map::Entry;
+
+    let transient_limit = allowance.map(|roots| roots.saturating_mul(2).max(1));
+    let mut poly = BTreeMap::<Vec<(u32, u32)>, Q>::new();
+    let mut top_coefficient = Q::ZERO;
+    for (powers, coefficient) in lambda {
+        if *coefficient == Q::ZERO {
+            continue;
+        }
+        let weight: u64 = powers
+            .iter()
+            .chain(ch)
+            .map(|&(index, power)| u64::from(index) * u64::from(power))
+            .sum();
+        if (g > 0
+            && powers
+                .iter()
+                .any(|&(index, power)| index == g && power >= 2))
+            || weight
+                > if g > 1 {
+                    3 * u64::from(g) - 3
+                } else {
+                    u64::from(g)
+                }
+        {
+            continue;
+        }
+        if g > 0 && powers.as_slice() == [(g, 1)] && ch.is_empty() {
+            top_coefficient += coefficient;
+            continue;
+        }
+        for (powers, value) in lambda_polynomial(powers, ch) {
+            match poly.entry(powers) {
+                Entry::Vacant(entry) => {
+                    entry.insert(value * coefficient);
+                }
+                Entry::Occupied(mut entry) => {
+                    *entry.get_mut() += value * coefficient;
+                    if *entry.get() == Q::ZERO {
+                        entry.remove();
+                    }
+                }
+            }
+            if transient_limit.is_some_and(|limit| poly.len() > limit) {
+                return None;
+            }
+        }
+    }
+    if allowance.is_some_and(|roots| poly.len() > roots) {
+        return None;
+    }
+    Some((poly.into_iter().collect(), top_coefficient))
+}
+
+fn integrate_lambda_polynomial(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    poly: Vec<ChMono>,
+    top_coefficient: Q,
+    no_ch: bool,
+) -> Q {
+    if poly.is_empty() && top_coefficient == Q::ZERO {
+        return Q::ZERO;
+    }
+    let threads = thread_count(g, if kappa.is_empty() && no_ch { 24 } else { 16 });
+    let roots = kappa_psi_roots(n, kappa, psi);
+    let direct = if top_coefficient == Q::ZERO {
+        Q::ZERO
+    } else {
+        top_coefficient * integrate_ch_roots(g, &roots, &[(g, 1)], &[], threads)
+    };
+    direct + integrate_polynomial_roots(g, &roots, poly, threads)
+}
+
+// Unrestricted linearity oracle for tests of the shared GRR batch itself.
+#[cfg(test)]
+fn integrate_sum(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(Vec<(u32, u32)>, Q)],
+    ch: &[(u32, u32)],
+) -> Q {
+    if lambda
+        .iter()
+        .all(|(_, coefficient)| *coefficient == Q::ZERO)
+    {
+        return Q::ZERO;
+    }
+    if let [(powers, coefficient)] = lambda {
+        return coefficient
+            * if kappa.is_empty() && ch.is_empty() {
+                integrate(g, n, psi, powers)
+            } else {
+                integrate_mixed(g, n, kappa, psi, powers, ch)
+            };
+    }
+    let (poly, top_coefficient) = lambda_sum_polynomial(g, lambda, ch, None).unwrap();
+    integrate_lambda_polynomial(g, n, kappa, psi, poly, top_coefficient, ch.is_empty())
 }
 
 fn collect_terms(mut terms: Vec<ChMono>) -> Vec<ChMono> {
@@ -819,6 +1010,124 @@ impl Split<'_> {
 mod tests {
     use super::*;
     use crate::hodge::{int_class, klp};
+
+    #[test]
+    fn reduced_lambda_root_growth_uses_the_original_polynomial() {
+        // These normal forms look shorter in lambda notation but contain
+        // more nonzero ch roots. Inspect only exact polynomial algebra here;
+        // no genus-eight or genus-nine descendant query is run by this test.
+        for (g, original) in [(8, vec![(3, 7)]), (9, vec![(4, 6)])] {
+            let reduced = crate::hodge::relations::reduce(g, &original).unwrap();
+            let allowance = lambda_polynomial(&original, &[]).len();
+            let (full, _) = lambda_sum_polynomial(g, &reduced, &[], None).unwrap();
+            assert!(
+                full.len() > allowance,
+                "g={g}, roots={} <= {allowance}",
+                full.len()
+            );
+            assert!(lambda_sum_polynomial(g, &reduced, &[], Some(allowance)).is_none());
+        }
+    }
+
+    #[test]
+    fn reduced_lambda_root_budget_preserves_accepted_and_original_values() {
+        let original = vec![(1, 2)];
+        let expected = integrate_with_threads(3, 1, &[(1, 5)], &original, 1);
+        let reduced = vec![(vec![(2, 1)], Q::from(2))];
+        match integrate_reduced(3, 1, &[], &[(1, 5)], &original, &reduced, &[]) {
+            ReducedIntegral::Reduced(value) => assert_eq!(value, expected),
+            ReducedIntegral::Original(_) => panic!("one-root normal form should be accepted"),
+        }
+
+        // An exact one-term query can still be represented by a deliberately
+        // more expensive unreduced polynomial. Falling back returns the whole
+        // original value, not just the value of any remaining reduced leaves.
+        let original = vec![(1, 4)];
+        let reduced = crate::hodge::relations::reduce(3, &original).unwrap();
+        let expected = integrate_with_threads(3, 1, &[(1, 3)], &original, 1);
+        match integrate_reduced(3, 1, &[], &[(1, 3)], &original, &reduced, &[]) {
+            ReducedIntegral::Original(value) => assert_eq!(value, expected),
+            ReducedIntegral::Reduced(_) => {
+                panic!("normal form with more roots should use original")
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_lambda_batches_match_individual_general_evaluations() {
+        // All terms in each batch have the same lambda weight. Include signed
+        // coefficients, marked psi, kappa pushforward, explicit ch and lambda_g.
+        for (n, kappa, psi, ch, terms) in [
+            (
+                0,
+                vec![],
+                vec![],
+                vec![],
+                vec![
+                    (vec![(1, 6)], Q::from(2)),
+                    (vec![(1, 4), (2, 1)], Q::from(-3)),
+                    (vec![(2, 3)], Q::from_signeds(1, 2)),
+                ],
+            ),
+            (
+                1,
+                vec![(1, 1)],
+                vec![(1, 2)],
+                vec![],
+                vec![
+                    (vec![(1, 4)], Q::from(2)),
+                    (vec![(1, 2), (2, 1)], Q::from(-3)),
+                    (vec![(2, 2)], Q::from_signeds(1, 2)),
+                ],
+            ),
+            (
+                1,
+                vec![(1, 1)],
+                vec![(1, 2)],
+                vec![(1, 1)],
+                vec![
+                    (vec![(1, 3)], Q::from(2)),
+                    (vec![(1, 1), (2, 1)], Q::from(-3)),
+                    (vec![(3, 1)], Q::from_signeds(1, 2)),
+                ],
+            ),
+            (
+                1,
+                vec![],
+                vec![(1, 4)],
+                vec![],
+                vec![
+                    (vec![(1, 3)], Q::from(2)),
+                    (vec![(1, 1), (2, 1)], Q::from(-3)),
+                    (vec![(3, 1)], Q::from_signeds(1, 2)),
+                ],
+            ),
+        ] {
+            let expected = terms.iter().fold(Q::ZERO, |sum, (powers, coefficient)| {
+                sum + coefficient * integrate_mixed_with_threads(3, n, &kappa, &psi, powers, &ch, 1)
+            });
+            assert_eq!(
+                integrate_sum(3, n, &kappa, &psi, &terms, &ch),
+                expected,
+                "n={n}, kappa={kappa:?}, psi={psi:?}, ch={ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reduced_lambda_cancellation_does_not_create_a_descendant_source() {
+        use crate::cache_source::with_registry;
+
+        let registry = Arc::new(Registry::new());
+        with_registry(registry.clone(), || {
+            // Mumford: lambda_1^2 - 2 lambda_2 = 0. In genus three neither
+            // term takes the separate lambda_g shortcut; their ch coefficients
+            // cancel before constructing an evaluator or a work graph.
+            let terms = vec![(vec![(1, 2)], Q::ONE), (vec![(2, 1)], Q::from(-2))];
+            assert_eq!(integrate_sum(3, 1, &[], &[(1, 5)], &terms, &[]), Q::ZERO);
+            assert!(registry.sources().is_empty());
+        });
+    }
 
     #[test]
     fn borrowed_root_memo_validates_genus_dimension_and_c_semantics() {

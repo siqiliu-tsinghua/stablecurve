@@ -119,11 +119,20 @@ Witten r-旋、广义 Hodge chern。返回值均为**精确有理数**。
 
 ### 2.2 Python
 
+`klp` 会先尝试 Hodge 闭式和 Mumford 关系。无标记空间上的
+`lambda_g lambda_(g-1) lambda_(g-2)` 与 `lambda_(g-1)^3` 直接使用
+Faber--Pandharipande 闭式，不构造后代工作图；含 `lambda_g lambda_(g-1)`
+的一般族也支持 κ/ψ/ch 混合插入，带标记因子先前推，再使用无标记公式。
+重复 λ 因子会在限定工作量内化简，剩余项合并后共享一次 GRR 计算；展开代价
+过大时使用原算法。对原本只有一个 ch 单项式的 λ₁/λ₂ 路径，只有能全部转为
+闭式求值时才接受这种展开，避免增加计算量。
+
 ```python
 from sc_faber import FABER
 f = FABER()                                  # 两级缓存，落盘到 ~/.faber/cache.sqlite
 f.klp(2, 2, psi=[(1,2)], lam=[(1,3)])        # Fraction(1, 1440)
 f.klp(7, 0, lam=[(1,18)])                    # Fraction(32017001, 638512875)
+f.klp(20, 0, lam=[(18,1), (19,1), (20,1)])  # 直接使用闭式
 f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 ```
 
@@ -135,6 +144,26 @@ f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 大的情形可达数十万个图（数百 MB），`f.clear_graph_cache()` 可将其释放。
 
 注：pyo3 层目前只暴露 `klp`/`dr`，其余 op 走 CLI。
+
+### 2.3 Rust 批量 Hodge 积分
+
+`hodge::lambda_integrals(g, callback)` 按分拆降序遍历次数为 `3g-3` 的全部纯
+λ 单项式，包括零积分。回调接收 λ 下标列表和精确有理数；函数返回已遍历的
+单项式数量。`hodge::lambda_monomial_count(g)` 只计算数量，不求积分。
+两者要求 `g >= 2`。
+
+```rust
+let total = sc_faber::hodge::lambda_integrals(4, |indices, value| {
+    println!("{indices:?}: {value}");
+    Ok(())
+})?;
+assert_eq!(total, 18);
+```
+
+批量入口通过 Mumford 关系复用较早的答案，其余情况调用 `klp`。放在
+`CacheSession::run` 内即可通过普通积分缓存持久化；回调报错会立即停止枚举。
+同一亏格用于复用的答案会保留到计算结束。完整输出与续跑处理见
+[hodge_data 示例](examples/hodge_data/README.md)。
 
 ---
 

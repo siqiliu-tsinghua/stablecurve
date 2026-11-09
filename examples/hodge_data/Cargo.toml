@@ -1,0 +1,16 @@
+[package]
+name = "hodge-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure Rust example enumerating top-degree Hodge integrals"
+
+[dependencies]
+sc-faber = { path = "../../crates/sc-faber" }
+sc-num = { path = "../../crates/sc-num" }
+
+[lints]
+workspace = true

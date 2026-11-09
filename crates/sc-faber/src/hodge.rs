@@ -1,5 +1,5 @@
-//! κ、λ、ch 与 ψ 类的积分。klp 先用带符号集合分划把 κ 化为后代，
-//! 再走 Mumford GRR 的直接后代递归。int_class 保留 Faber 旧路线供对照。
+//! κ、λ、ch 与 ψ 类的积分。klp 先尝试闭式与 Mumford 关系化简，再用带符号
+//! 集合分划把 κ 化为后代，走 GRR 的直接后代递归。int_class 保留旧路线供对照。
 //!
 //! int_class 的旧路线（KaLa5）：
 //! - λ_i 按 Mumford 生成函数展开为奇 ch：
@@ -23,8 +23,13 @@ use crate::taut::{DecStratum, TautClass};
 use sc_num::{One, Q, Zero, is_zero};
 use std::sync::{Arc, Weak};
 
+mod closed;
+mod lambda;
 mod psi;
+mod relations;
 pub(crate) mod root_source;
+
+pub use lambda::{lambda_integrals, lambda_monomial_count};
 
 pub(crate) fn clear_cache_context(id: u64) {
     psi::clear_cache_context(id);
@@ -540,6 +545,7 @@ fn fund_monomial(
 
 /// 完整 klp：∫_{M̄_{g,n}} κ^κ·ψ^ψ·λ^λ·ch^ch。
 ///
+/// 先尝试 Hodge 闭式与 Mumford 关系；未消去的项合并后交给通用 GRR。
 /// 纯 λ-ψ 的较大查询自动并行（默认最多 24 个可用线程）。
 /// `SC_FABER_THREADS=1` 使用串行递归；正整数可指定并行线程数上限。
 /// 并行任务共享已完成的子积分，同一调用线程的后续查询继续复用结果。
@@ -560,16 +566,11 @@ pub fn klp(
     // Errors and the established zero/pure/mixed route are decided before any
     // root cache can return a value for an otherwise rejected input.
     let route = klp_route(g, n, kappa, psi, lambda, ch)?;
-    let calculate = || -> Result<Q, String> {
-        Ok(match route {
-            KlpRoute::Zero => Q::ZERO,
-            KlpRoute::Pure => psi::integrate(g, n, psi, lambda),
-            KlpRoute::Mixed => psi::integrate_mixed(g, n, kappa, psi, lambda, ch),
-        })
-    };
+    let calculate = || calculate_klp(g, n, kappa, psi, lambda, ch, route);
     // 固定本次调用的结果归属。未启用缓存时不建立根结果目录或后台读取口。
     if let Some(registry) = crate::cache_source::current_registry() {
-        let read_history = !inexpensive_klp(g, n, psi, lambda, ch, route);
+        let read_history = !(inexpensive_klp(g, n, psi, lambda, ch, route)
+            || closed::inexpensive(g, n, kappa, psi, lambda, ch));
         return root_source::with_registry_policy(
             registry,
             g,
@@ -583,6 +584,142 @@ pub fn klp(
         );
     }
     crate::cache_source::with_optional_registry(None, calculate)
+}
+
+fn unreduced_klp(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+    route: KlpRoute,
+) -> Q {
+    match route {
+        KlpRoute::Zero => Q::ZERO,
+        KlpRoute::Pure => psi::integrate(g, n, psi, lambda),
+        KlpRoute::Mixed => psi::integrate_mixed(g, n, kappa, psi, lambda, ch),
+    }
+}
+
+fn calculate_klp(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+    route: KlpRoute,
+) -> Result<Q, String> {
+    if matches!(route, KlpRoute::Zero) {
+        return Ok(Q::ZERO);
+    }
+    if !lambda.iter().any(|&(index, _)| index > 0) {
+        return Ok(unreduced_klp(g, n, kappa, psi, lambda, ch, route));
+    }
+    // Preserve the original degree/pullback guards before spending work on a
+    // lambda normal form. Input errors have already been checked by klp_route.
+    let hodge_weight = lambda
+        .iter()
+        .chain(ch)
+        .map(|&(index, power)| u128::from(index) * u128::from(power))
+        .sum::<u128>();
+    let weight = hodge_weight
+        + kappa
+            .iter()
+            .map(|&(index, power)| u128::from(index) * u128::from(power))
+            .sum::<u128>()
+        + psi
+            .iter()
+            .map(|&(_, power)| u128::from(power))
+            .sum::<u128>();
+    if weight as i128 != 3 * i128::from(g) - 3 + i128::from(n)
+        || hodge_weight
+            > if g > 1 {
+                3 * u128::from(g) - 3
+            } else {
+                u128::from(g)
+            }
+        || (g > 0
+            && lambda
+                .iter()
+                .any(|&(index, power)| index == g && power >= 2))
+    {
+        return Ok(Q::ZERO);
+    }
+    if let Some(value) = closed::value(g, n, kappa, psi, lambda, ch) {
+        return Ok(value);
+    }
+    // lambda_1=ch_1 and lambda_2=ch_1^2/2 already give one GRR monomial.
+    // Expanding them into higher lambda indices usually creates extra ch
+    // roots. Only do so when the lambda weight forces every squarefree leaf
+    // to contain both top classes, hence all leaves have a closed pairing.
+    // The largest squarefree weight missing g or g-1 is g(g-1)/2 + 1.
+    if g >= 2
+        && lambda.iter().all(|&(index, _)| index <= 2)
+        && lambda
+            .iter()
+            .map(|&(index, power)| u128::from(index) * u128::from(power))
+            .sum::<u128>()
+            <= u128::from(g) * u128::from(g - 1) / 2 + 1
+    {
+        return Ok(unreduced_klp(g, n, kappa, psi, lambda, ch, route));
+    }
+    let Some(reduced) = relations::reduce(g, lambda) else {
+        return Ok(unreduced_klp(g, n, kappa, psi, lambda, ch, route));
+    };
+    let mut result = Q::ZERO;
+    let mut closed_terms = Vec::new();
+    let mut remaining = Vec::new();
+    for (term, coefficient) in reduced {
+        let has_top_pair = g >= 2
+            && term.iter().any(|&(index, _)| index == g)
+            && term.iter().any(|&(index, _)| index == g - 1);
+        if has_top_pair || inexpensive_klp(g, n, psi, &term, ch, route) {
+            closed_terms.push((term, coefficient));
+        } else {
+            remaining.push((term, coefficient));
+        }
+    }
+    if !remaining.is_empty() {
+        // Expand and combine all remaining leaves before planning. Running a
+        // separate descendant graph per leaf loses the shared-GRR advantage.
+        match psi::integrate_reduced(g, n, kappa, psi, lambda, &remaining, ch) {
+            psi::ReducedIntegral::Reduced(value) => result += value,
+            // The backend reused the original ch expansion when the reduced
+            // representation would grow the graph. Its value already covers
+            // the entire monomial, so do not evaluate the closed leaves.
+            psi::ReducedIntegral::Original(value) => return Ok(value),
+        }
+    }
+    for (term, coefficient) in closed_terms {
+        // Publish individually evaluated leaves only after accepting the
+        // reduction. No source lock spans these ordinary public calls.
+        result += coefficient * klp(g, n, kappa, psi, &term, ch)?;
+    }
+    Ok(result)
+}
+
+// Independent pre-reduction route for mathematical oracle tests. It bypasses
+// optimized public root values as well as both new simplification modules.
+#[cfg(test)]
+pub(crate) fn klp_unreduced(
+    g: u32,
+    n: u32,
+    kappa: &[(u32, u32)],
+    psi: &[(u32, u32)],
+    lambda: &[(u32, u32)],
+    ch: &[(u32, u32)],
+) -> Result<Q, String> {
+    crate::kppoly::check_marking_legs(psi, n)?;
+    let psi = crate::kppoly::merge_psi(psi);
+    let kappa = normalized_powers(kappa);
+    let lambda = normalized_powers(lambda);
+    let ch = normalized_powers(ch);
+    let route = klp_route(g, n, &kappa, &psi, &lambda, &ch)?;
+    crate::cache_source::with_optional_registry(None, || {
+        Ok(unreduced_klp(g, n, &kappa, &psi, &lambda, &ch, route))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -682,6 +819,115 @@ fn klp_route(
 mod tests {
     use super::*;
     use crate::cache_source::{ResultSource, with_optional_registry, with_registry};
+
+    #[test]
+    fn reduced_pure_hodge_monomials_match_the_original_backend() {
+        fn visit(g: u32, remaining: u32, cap: u32, parts: &mut Vec<(u32, u32)>) {
+            if remaining == 0 {
+                assert_eq!(
+                    klp(g, 0, &[], &[], parts, &[]),
+                    klp_unreduced(g, 0, &[], &[], parts, &[]),
+                    "g={g}, lambda={parts:?}"
+                );
+                return;
+            }
+            for index in (1..=remaining.min(cap)).rev() {
+                if let Some(last) = parts.last_mut().filter(|last| last.0 == index) {
+                    last.1 += 1;
+                    visit(g, remaining - index, index, parts);
+                    parts.last_mut().unwrap().1 -= 1;
+                } else {
+                    parts.push((index, 1));
+                    visit(g, remaining - index, index, parts);
+                    parts.pop();
+                }
+            }
+        }
+        for g in 2..=6 {
+            visit(g, 3 * g - 3, g, &mut Vec::new());
+        }
+    }
+
+    #[test]
+    fn reduced_mixed_monomials_match_the_original_backend() {
+        for g in 2..=4 {
+            for n in 1..=2 {
+                for lambda in [
+                    vec![(1, 2)],
+                    vec![(1, 3)],
+                    vec![(2, 2)],
+                    vec![(1, 2), (2, 2)],
+                    vec![(g - 1, 3)],
+                ] {
+                    for kappa in [vec![], vec![(1, 1)], vec![(1, 2)]] {
+                        for ch in [vec![], vec![(1, 1)], vec![(3, 1)]] {
+                            let weight: u32 = lambda
+                                .iter()
+                                .chain(&kappa)
+                                .chain(&ch)
+                                .map(|&(index, power)| index * power)
+                                .sum();
+                            let Some(power) = (3 * g - 3 + n).checked_sub(weight) else {
+                                continue;
+                            };
+                            let psi = [(1, power)];
+                            assert_eq!(
+                                klp(g, n, &kappa, &psi, &lambda, &ch),
+                                klp_unreduced(g, n, &kappa, &psi, &lambda, &ch),
+                                "g={g}, n={n}, k={kappa:?}, p={psi:?}, l={lambda:?}, ch={ch:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual small cold comparison of algebraic reduction and the original backend"]
+    fn benchmark_hodge_reduction() {
+        for (g, lambda) in [
+            (5, vec![(1, 12)]),
+            (8, vec![(1, 21)]),
+            (10, vec![(1, 27)]),
+            (9, vec![(2, 12)]),
+            (8, vec![(3, 7)]),
+            (9, vec![(4, 6)]),
+        ] {
+            let normalization = std::time::Instant::now();
+            let normal_form = relations::reduce(g, &lambda);
+            eprintln!(
+                "hodge_normal_form g={g} lambda={lambda:?} elapsed_s={:.6} leaves={:?}",
+                normalization.elapsed().as_secs_f64(),
+                normal_form.as_ref().map(Vec::len)
+            );
+            let run = |reduced: bool| {
+                let lambda = lambda.clone();
+                std::thread::spawn(move || {
+                    with_optional_registry(None, || {
+                        let started = std::time::Instant::now();
+                        let value = if reduced {
+                            klp(g, 0, &[], &[], &lambda, &[])
+                        } else {
+                            klp_unreduced(g, 0, &[], &[], &lambda, &[])
+                        }
+                        .unwrap();
+                        (value, started.elapsed())
+                    })
+                })
+                .join()
+                .unwrap()
+            };
+            let (expected, original) = run(false);
+            let (actual, reduced) = run(true);
+            assert_eq!(actual, expected);
+            eprintln!(
+                "hodge_reduction g={g} lambda={lambda:?} original_s={:.6} reduced_s={:.6}",
+                original.as_secs_f64(),
+                reduced.as_secs_f64()
+            );
+        }
+    }
 
     #[test]
     fn int_class_non_top_legal_roots_persist_zero_without_duplicate_completions() {

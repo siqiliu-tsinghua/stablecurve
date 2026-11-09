@@ -14,6 +14,7 @@
 | `sc-num` | malachite 有理数包装（三引擎共用） | — |
 
 - **用法（CLI + Python）**：[USER_GUIDE.zh-CN.md](USER_GUIDE.zh-CN.md)
+- **纯 Rust 示例**：[计算全部顶次 Hodge 积分](examples/hodge_data/README.md#中文)
 - **分析与设计**：[docs/GROWI_REDESIGN.md](docs/GROWI_REDESIGN.md)、
   [docs/FABER_REDESIGN.md](docs/FABER_REDESIGN.md)、
   [docs/GWALL_REDESIGN.md](docs/GWALL_REDESIGN.md)
@@ -60,6 +61,35 @@ growi↔faber 交叉验证。与 admcycles 的 g ≤ 14 全量对拍是一次性
 `tools/admcycles_hodge.py check --max-genus 14`（约一小时）。v0.1.0 发布前
 曾在 Windows 11、Debian 13（rustc 1.85.1）与 macOS 26.7（Intel）上人工
 验证。
+
+## 示例：生成 Hodge 积分数据
+
+[`examples/hodge_data`](examples/hodge_data/README.md#中文) 是纯 Rust 程序，
+给定 2 ≤ g ≤ 20，枚举 λ₁、…、λ_g 中加权次数为 3g−3 的全部单项式，计算
+它们在 M̄_g 上的积分，包括零值。示例调用 `sc-faber` 的批量入口，共享
+Mumford 关系、闭式公式和已完成的答案；SQLite 保存结果与可复用的中间积分。
+
+```bash
+cargo run --release -p hodge-data  # 默认小例子：g=2..4
+```
+
+每个亏格输出 `target/hodge-data/hodge_data_gG.sage`。亏格选择、线程、内存
+预算、输出路径与续跑方法见示例说明。生成的数据和 SQLite 缓存保存在本地，
+与源码分开。
+
+文件使用与 [admcycles 预计算 Hodge 数据表](https://gitlab.com/modulispaces/admcycles/-/blob/master/README.rst)
+相同的 `hodge_number[(lambda 下标)]` 赋值格式。在 **SageMath 会话**中，
+可直接加载到新表或已有表中：
+
+```python
+hodge_number = globals().get("hodge_number", {})
+load("target/hodge-data/hodge_data_g4.sage")
+hodge_number[(4, 3, 2)]  # 1/87091200
+```
+
+键按 λ 下标降序排列，重复因子保留重复下标；数值为精确有理数。该表可以与
+admcycles 一起用于查表和后续计算；加载数据不会自动填充 admcycles 的
+[`hodge_recursion` 算法缓存](https://gitlab.com/modulispaces/admcycles/-/blob/master/admcycles/hodge_recursion.py)。
 
 ## 许可证
 

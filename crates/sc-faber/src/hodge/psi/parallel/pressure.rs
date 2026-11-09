@@ -1349,6 +1349,7 @@ struct PartCounts {
 
 struct EvaluationProbe {
     started: Instant,
+    last_live_report: Instant,
     active: Option<(EvaluationPhase, Instant)>,
     phase_ns: [u128; 4],
     by_parts: Vec<PartCounts>,
@@ -1369,8 +1370,10 @@ struct EvaluationProbe {
 
 impl EvaluationProbe {
     fn new(threads: usize, group_limit: usize, next_layer: usize) -> Self {
+        let started = Instant::now();
         Self {
-            started: Instant::now(),
+            started,
+            last_live_report: started,
             active: None,
             phase_ns: [0; 4],
             by_parts: vec![PartCounts::default(); threads.max(1) + 1],
@@ -1417,6 +1420,66 @@ impl EvaluationProbe {
         parts.equations = parts.equations.saturating_add(count);
         self.unfinished_group = false;
         self.current_parts = 0;
+    }
+
+    fn report_if_due(
+        &mut self,
+        layer: usize,
+        start: usize,
+        count: usize,
+        event: &str,
+        required_bytes: u64,
+    ) {
+        let now = Instant::now();
+        if now.duration_since(self.last_live_report) < Duration::from_secs(5) {
+            return;
+        }
+        self.last_live_report = now;
+        let mut phase_ns = self.phase_ns;
+        let phase = match self.active {
+            Some((phase, began)) => {
+                phase_ns[phase as usize] += now.duration_since(began).as_nanos();
+                match phase {
+                    EvaluationPhase::Admission => "admission",
+                    EvaluationPhase::Load => "load",
+                    EvaluationPhase::Compute => "compute",
+                    EvaluationPhase::Writeback => "writeback",
+                }
+            }
+            None => "between_phases",
+        };
+        // Read the existing cached ledger only for a live diagnostic line.
+        // Reporting must not sample memory or request reclamation itself.
+        let decision = process_budget().check(0);
+        let seconds = |ns: u128| ns as f64 / 1e9;
+        eprintln!(
+            "sc-faber: pressure evaluation live wall_s={:.6} groups={} equations={} layer={} start={} count={} phase={} event={} admission_attempts={} shrinks={} retry_waits={} required_bytes={} admission_s={:.6} load_s={:.6} compute_scope_s={:.6} writeback_heap_s={:.6} private_bytes={:?} projected_bytes={:?} active_bytes={} settled_bytes={} pressure={:?} limits={:?} sample_age_ms={} sample_generation={} stale={}",
+            now.duration_since(self.started).as_secs_f64(),
+            self.groups,
+            self.equations,
+            layer,
+            start,
+            count,
+            phase,
+            event,
+            self.attempts,
+            self.shrinks,
+            self.retry_waits,
+            required_bytes,
+            seconds(phase_ns[EvaluationPhase::Admission as usize]),
+            seconds(phase_ns[EvaluationPhase::Load as usize]),
+            seconds(phase_ns[EvaluationPhase::Compute as usize]),
+            seconds(phase_ns[EvaluationPhase::Writeback as usize]),
+            decision.known_private_bytes,
+            decision.projected_private_bytes,
+            decision.active_reserved_bytes,
+            decision.settled_reserved_bytes,
+            decision.pressure,
+            decision.limits,
+            decision.sample_age.as_millis(),
+            decision.sample_generation,
+            decision.stale,
+        );
     }
 }
 
@@ -1524,6 +1587,13 @@ pub(super) fn evaluate_from(
                         }
                         if let Some(probe) = &mut probe {
                             probe.retry_waits = probe.retry_waits.saturating_add(1);
+                            probe.report_if_due(
+                                layer_index,
+                                start,
+                                count,
+                                "metadata_retry",
+                                admission,
+                            );
                         }
                         if retry(workspace, started) {
                             continue;
@@ -1571,6 +1641,7 @@ pub(super) fn evaluate_from(
                     }
                     if let Some(probe) = &mut probe {
                         probe.retry_waits = probe.retry_waits.saturating_add(1);
+                        probe.report_if_due(layer_index, start, count, "block_retry", total);
                     }
                     if retry(workspace, started) {
                         continue;
@@ -1579,6 +1650,7 @@ pub(super) fn evaluate_from(
                 }
                 if let Some(probe) = &mut probe {
                     probe.phase(Some(EvaluationPhase::Load));
+                    probe.report_if_due(layer_index, start, count, "load_group", total);
                 }
                 let blocks = workspace
                     .load_pinned_blocks(group, &credit)
@@ -1653,6 +1725,7 @@ pub(super) fn evaluate_from(
             start += count;
             if let Some(probe) = &mut probe {
                 probe.complete_group(count, started);
+                probe.report_if_due(layer_index, start, count, "group_complete", 0);
             }
         }
         // Same-rank groups cannot observe one another. Only a fully completed
