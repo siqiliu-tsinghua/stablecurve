@@ -20,6 +20,11 @@ common rational-number layer (`sc-num`):
   [docs/FABER_REDESIGN.md](docs/FABER_REDESIGN.md),
   [docs/GWALL_REDESIGN.md](docs/GWALL_REDESIGN.md)
 
+**0.4.0.** FABER adds instance-owned cache sessions, background SQLite
+persistence, memory budgets and explicit flush/close operations. Hodge queries
+share relation and closed-form simplifications, with a Rust batch API for the
+[Hodge data example](examples/hodge_data/README.md).
+
 **Interfaces.** Each engine is a Rust library with a CLI and a Python
 module; results are exact rationals (`Fraction` in Python). `sc-growi` and
 `sc-gwall` offer the same functionality in all three. `sc-faber` covers
@@ -30,6 +35,7 @@ less outside Rust:
 | `klp` (κ/ψ/λ/ch monomials), `dr` (Pixton DR) | ✓ | ✓ | ✓ |
 | `drpoly`, `drspin`, `witten`, `hyperell`, `biell`, `grr` | ✓ | ✓ | — |
 | Θ class, Hain divisor | ✓ | — | — |
+| `lambda_integrals`, `lambda_monomial_count` (batch Hodge integrals) | ✓ | — | — |
 
 ## Quick start
 

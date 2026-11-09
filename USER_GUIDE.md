@@ -98,6 +98,11 @@ generalized Hodge chern. All results are **exact rationals**.
 ./target/release/faber --batch --cache fb.sqlite < queries.jsonl
 ```
 
+`--cache PATH` enables background SQLite persistence; omitting it uses memory
+only. Normal CLI exit waits for pending writes and reports cache-close errors.
+After an interruption, only committed integral results can be reused;
+unfinished query planning is rebuilt.
+
 Responses: `{"line":k,"status":"ok","value":"p/q"}` or
 `{"line":k,"status":"error","error":"..."}`. Common fields: `g` (genus),
 `kappa` ([[index,power],…]), `psi` ([[leg,power],…]). ψ legs must be
@@ -151,9 +156,24 @@ f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 ```
 
 `FABER(cache="path")` uses the given file and `FABER(cache="")` disables
-the persistent cache. The persistent cache is **process-wide**: creating a
-new `FABER` replaces (or detaches) the cache of earlier instances, and
-`cache_attached` reports the current state.
+the persistent cache. Each instance owns an independent cache session; creating
+another instance leaves existing sessions attached. `cache_attached` reports
+whether this instance has an open, usable cache, and `cache_error` reports an
+asynchronous cache error, if any.
+
+```python
+FABER.set_memory_limit(4 * 1024**3)  # bytes; shared process budget for cached calculations
+f.flush_cache()                     # wait for already-published results to commit
+f.close_cache()                     # flush, close and detach this instance's session
+FABER.set_memory_limit(None)        # restore automatic memory budgeting
+```
+
+The budget covers computation and storage, with space reserved for progress;
+it is not a separate allowance for each instance. Choose it for the workload:
+SQLite persistence does not guarantee completion under arbitrarily low budgets.
+Ordinary mathematical calls may return before background writes finish. Use
+`flush_cache` or `close_cache` to confirm persistence and receive storage errors.
+Only committed results survive abrupt termination; unfinished planning is rebuilt.
 
 Stable graphs enumerated for `dr` are also kept in memory, layer by layer
 per (g, n), so repeated calls reuse them. Large cases can hold hundreds of
@@ -172,11 +192,18 @@ number of visited monomials. `hodge::lambda_monomial_count(g)` gives that count
 without evaluating integrals. These functions require `g >= 2`.
 
 ```rust
-let total = sc_faber::hodge::lambda_integrals(4, |indices, value| {
-    println!("{indices:?}: {value}");
-    Ok(())
+use sc_faber::socle::CacheSession;
+
+let cache = CacheSession::open("hodge.sqlite")?;
+let total = cache.run(|| {
+    sc_faber::hodge::lambda_integrals(4, |indices, value| {
+        println!("{indices:?}: {value}");
+        Ok(())
+    })
 })?;
 assert_eq!(total, 18);
+cache.flush()?;
+cache.close()?;
 ```
 
 The batch reuses earlier answers via Mumford relations; unresolved cases use
@@ -184,6 +211,11 @@ The batch reuses earlier answers via Mumford relations; unresolved cases use
 as individual calls. Callback errors stop enumeration immediately. Per-genus
 reuse retains answers in memory until completion. See the full
 [hodge_data example](examples/hodge_data/README.md) for output and resume handling.
+
+Rust callers use `socle::set_cache_memory_limit(Some(bytes))` for the shared
+process budget, or `None` for automatic budgeting. `CacheSession::flush` confirms
+published results; `close` waits for active calls and closes the session. Handle
+their errors explicitly when durability matters.
 
 ---
 

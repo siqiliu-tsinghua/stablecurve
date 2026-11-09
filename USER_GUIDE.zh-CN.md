@@ -88,6 +88,10 @@ Witten r-旋、广义 Hodge chern。返回值均为**精确有理数**。
 ./target/release/faber --batch --cache fb.sqlite < queries.jsonl
 ```
 
+`--cache PATH` 启用 SQLite 后台持久化；省略时只用内存。CLI 正常退出前等待
+尚未提交的数据写入，并报告缓存关闭错误。中断后只能复用已经提交的积分结果，
+未完成查询的工作图仍需重建。
+
 应答：`{"line":k,"status":"ok","value":"p/q"}` 或
 `{"line":k,"status":"error","error":"..."}`。公共字段：`g`（亏格）、
 `kappa`（[[指标,幂],…]）、`psi`（[[腿号,幂],…]）。ψ 腿号须为标记
@@ -137,8 +141,21 @@ f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 ```
 
 `FABER(cache="路径")` 使用指定文件，`FABER(cache="")` 不用持久缓存。
-持久缓存是**进程全局**的：新建 `FABER` 会替换（或卸下）此前实例挂接的
-缓存，`cache_attached` 反映当前状态。
+每个实例独立持有缓存会话，新建实例不会卸下已有实例的缓存。
+`cache_attached` 表示当前实例是否有打开且可用的缓存，`cache_error` 返回
+异步缓存错误，没有错误时为 `None`。
+
+```python
+FABER.set_memory_limit(4 * 1024**3)  # 字节；同进程持久缓存计算共享预算
+f.flush_cache()                     # 等待已发布的结果提交
+f.close_cache()                     # 刷新、关闭并卸下当前实例的会话
+FABER.set_memory_limit(None)        # 恢复自动内存预算
+```
+
+预算覆盖计算与存储，并预留进展空间，不是每个实例各自独享的额度。预算应与
+任务规模匹配，SQLite 持久化不保证任意任务都能在极低预算下完成。普通数学调用
+可能先于后台写盘返回；用 `flush_cache` 或 `close_cache` 确认持久化并接收存储
+错误。异常终止后只能复用已提交结果，未完成的工作图会重建。
 
 `dr` 等枚举出的稳定图也按 (g, n) 逐层留在内存里，重复调用直接复用。
 大的情形可达数十万个图（数百 MB），`f.clear_graph_cache()` 可将其释放。
@@ -153,17 +170,28 @@ f.dr(2, [1,1,-2], r=2, kappa=[(1,1)], psi=[(1,3)])   # Fraction(13, 144)
 两者要求 `g >= 2`。
 
 ```rust
-let total = sc_faber::hodge::lambda_integrals(4, |indices, value| {
-    println!("{indices:?}: {value}");
-    Ok(())
+use sc_faber::socle::CacheSession;
+
+let cache = CacheSession::open("hodge.sqlite")?;
+let total = cache.run(|| {
+    sc_faber::hodge::lambda_integrals(4, |indices, value| {
+        println!("{indices:?}: {value}");
+        Ok(())
+    })
 })?;
 assert_eq!(total, 18);
+cache.flush()?;
+cache.close()?;
 ```
 
 批量入口通过 Mumford 关系复用较早的答案，其余情况调用 `klp`。放在
 `CacheSession::run` 内即可通过普通积分缓存持久化；回调报错会立即停止枚举。
 同一亏格用于复用的答案会保留到计算结束。完整输出与续跑处理见
 [hodge_data 示例](examples/hodge_data/README.md)。
+
+Rust 调用方用 `socle::set_cache_memory_limit(Some(bytes))` 配置共享进程预算，
+用 `None` 恢复自动预算。`CacheSession::flush` 确认已发布结果的提交；`close`
+等待活动调用结束并关闭会话。需要耐久保证时应显式处理这两个方法的错误。
 
 ---
 

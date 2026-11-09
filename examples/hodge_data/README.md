@@ -40,6 +40,11 @@ only handles arguments, cache ownership, output and progress. The thread setting
 controls backend computation; monomials are visited sequentially. Values needed
 by the batch remain in memory until the genus finishes.
 
+The example's current scope stops at g=20; higher genera have not been validated.
+The memory budget must fit the workload's remaining working set. SQLite
+persistence and work-block spilling do not guarantee completion under
+arbitrarily low budgets.
+
 Each completed genus produces `hodge_data_gG.sage`. A descending tuple lists
 lambda indices, so `(4, 3, 2)` represents `lambda_4 * lambda_3 * lambda_2`.
 To read a result in Sage:
@@ -88,6 +93,9 @@ cargo test --release -p sc-faber hodge::lambda
 计算中对同一亏格较早结果的复用，避免逐条独立计算造成回归。批量复用的数值
 会保留到该亏格完成；回调逐条输出不代表内存用量恒定。小亏格下与原算法的精确
 对照纳入主库 CI。
+
+示例当前范围止于 g=20，更高亏格尚未验证。内存预算必须能容纳任务仍需常驻的
+工作集；SQLite 持久化和工作块溢写不保证任意任务都能在极低预算下完成。
 
 默认输出与缓存目录为 Git 忽略的 `target/hodge-data/`，可用 `--data-dir PATH`
 修改。每个亏格输出 `hodge_data_gG.sage`，降序元组表示 lambda 下标列表；

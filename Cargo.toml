@@ -4,7 +4,7 @@ members = ["crates/*", "examples/hodge_data"]
 
 [workspace.package]
 edition = "2024"
-version = "0.2.1"
+version = "0.4.0"
 license = "GPL-3.0-or-later"
 rust-version = "1.85"
 repository = "https://github.com/siqiliu-tsinghua/stablecurve"

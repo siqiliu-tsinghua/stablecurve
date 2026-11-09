@@ -19,6 +19,10 @@
   [docs/FABER_REDESIGN.md](docs/FABER_REDESIGN.md)、
   [docs/GWALL_REDESIGN.md](docs/GWALL_REDESIGN.md)
 
+**0.4.0。** FABER 新增实例独立缓存会话、SQLite 后台持久化、内存预算及显式
+刷新/关闭接口。Hodge 查询共用关系化简和闭式公式，并提供 Rust 批量入口供
+[Hodge 数据示例](examples/hodge_data/README.md#中文)使用。
+
 **接口。** 每个引擎都是 Rust 库，另有 CLI 与 Python 模块，结果均为精确
 有理数（Python 中为 `Fraction`）。`sc-growi` 与 `sc-gwall` 三种接口功能
 相同；`sc-faber` 在 Rust 之外只覆盖一部分：
@@ -28,6 +32,7 @@
 | `klp`（κ/ψ/λ/ch 单项式）、`dr`（Pixton DR） | ✓ | ✓ | ✓ |
 | `drpoly`、`drspin`、`witten`、`hyperell`、`biell`、`grr` | ✓ | ✓ | — |
 | Θ 类、Hain 除子 | ✓ | — | — |
+| `lambda_integrals`、`lambda_monomial_count`（批量 Hodge 积分） | ✓ | — | — |
 
 ## 快速开始
 
