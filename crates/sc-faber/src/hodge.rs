@@ -25,6 +25,8 @@ use std::sync::{Arc, Weak};
 
 mod closed;
 mod lambda;
+#[cfg(test)]
+mod measure_pressure;
 mod psi;
 mod relations;
 pub(crate) mod root_source;

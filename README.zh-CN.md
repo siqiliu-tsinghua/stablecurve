@@ -77,6 +77,9 @@ cargo run --release -p hodge-data  # 默认小例子：g=2..4
 预算、输出路径与续跑方法见示例说明。生成的数据和 SQLite 缓存保存在本地，
 与源码分开。
 
+内存预算应与任务规模匹配；SQLite 持久化不保证任意任务都能在极低预算下完成。
+当前能力边界见[缓存设计范围](docs/FABER_CACHE_DESIGN.md#16-2026-11-09本轮范围收口)。
+
 文件使用与 [admcycles 预计算 Hodge 数据表](https://gitlab.com/modulispaces/admcycles/-/blob/master/README.rst)
 相同的 `hodge_number[(lambda 下标)]` 赋值格式。在 **SageMath 会话**中，
 可直接加载到新表或已有表中：

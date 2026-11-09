@@ -67,6 +67,81 @@ impl Drop for WriteAccess<'_> {
 }
 
 impl ParallelSource {
+    /// Test-only attribution at coarse query boundaries. These are container
+    /// payload/capacity estimates, not allocator usage or an atomic RSS sample.
+    #[cfg(test)]
+    pub(super) fn inspect_layout(&self, label: &str) {
+        let (value_len, value_capacity_bytes, value_heap_bytes) = {
+            let values = self.read();
+            (
+                values.len(),
+                values.capacity().saturating_mul(size_of::<Q>()),
+                values.iter().fold(0usize, |bytes, value| {
+                    bytes.saturating_add(value_bytes(value).saturating_sub(size_of::<Q>()))
+                }),
+            )
+        };
+        // Match the consumer's directory -> queued states lock order. Do not
+        // retain a result-table guard while waiting for either mutex.
+        let directory = self.directory.lock().unwrap();
+        let states = self.states.lock().unwrap();
+        let batches = self.batches.lock().unwrap();
+        let mut queued_state_count = 0usize;
+        let mut raw_unique_bytes = 0usize;
+        let mut raw_shared_bytes = 0usize;
+        let mut account = |states: &Arc<Vec<State>>| {
+            let bytes = raw_state_payload_bytes(states, states.capacity());
+            if Arc::strong_count(states) == 1 {
+                raw_unique_bytes = raw_unique_bytes.saturating_add(bytes);
+            } else {
+                raw_shared_bytes = raw_shared_bytes.saturating_add(bytes);
+            }
+        };
+        for state in states.iter() {
+            queued_state_count = queued_state_count.saturating_add(state.len());
+            account(state);
+        }
+        let (active_state_count, active_unencoded_count) =
+            directory
+                .active
+                .as_ref()
+                .map_or((0, 0), |(states, position)| {
+                    account(states);
+                    (states.len(), states.len().saturating_sub(*position))
+                });
+        let mut batch_layer_bytes = 0usize;
+        let mut batch_dirty_layer_bytes = 0usize;
+        let mut batch_offset_bytes = 0usize;
+        for batch in batches.iter() {
+            batch_layer_bytes = batch_layer_bytes.saturating_add(layer_bytes(&batch.layers));
+            if let Some(dirty) = &batch.dirty_layers {
+                batch_dirty_layer_bytes =
+                    batch_dirty_layer_bytes.saturating_add(layer_bytes(dirty));
+            }
+            batch_offset_bytes = batch_offset_bytes
+                .saturating_add(batch.offsets.capacity().saturating_mul(size_of::<usize>()));
+        }
+        println!(
+            "layout source label={label} value_len={value_len} value_capacity_bytes={value_capacity_bytes} value_heap_bytes={value_heap_bytes} queued_state_batches={} queued_state_count={queued_state_count} active_state_count={active_state_count} active_unencoded_count={active_unencoded_count} raw_state_unique_payload_bytes={raw_unique_bytes} raw_state_shared_payload_bytes={raw_shared_bytes} queue_capacity_bytes={} directory_len_bytes={} directory_capacity_bytes={} directory_offset_count={} directory_offset_capacity_bytes={} directory_scratch_capacity_bytes={} batches={} batch_layer_capacity_bytes={batch_layer_bytes} batch_dirty_layer_capacity_bytes={batch_dirty_layer_bytes} batch_offset_capacity_bytes={batch_offset_bytes} batch_container_capacity_bytes={} ready={} durable={} shared_payload_not_exclusive=true allocator_and_arc_headers_not_included=true non_atomic_snapshot=true",
+            states.len(),
+            states
+                .capacity()
+                .saturating_mul(size_of::<Arc<Vec<State>>>()),
+            directory.bytes.len(),
+            directory.bytes.capacity(),
+            directory.offsets.len(),
+            directory
+                .offsets
+                .capacity()
+                .saturating_mul(size_of::<usize>()),
+            directory.encoded_scratch.capacity(),
+            batches.len(),
+            batches.capacity().saturating_mul(size_of::<Arc<Batch>>()),
+            self.ready.load(Ordering::Acquire),
+            self.durable.load(Ordering::Acquire),
+        );
+    }
+
     pub(super) fn begin_use(&self) -> RwLockReadGuard<'_, ()> {
         self.usage.read().unwrap_or_else(|error| error.into_inner())
     }
@@ -299,6 +374,20 @@ fn state_bytes(states: &Arc<Vec<State>>) -> usize {
     }
     states.iter().fold(
         states.capacity().saturating_mul(size_of::<State>()),
+        |bytes, state| {
+            bytes
+                .saturating_add(state.d.capacity().saturating_mul(size_of::<u32>()))
+                .saturating_add(state.ch.capacity().saturating_mul(size_of::<(u32, u32)>()))
+        },
+    )
+}
+
+#[cfg(test)]
+fn raw_state_payload_bytes(states: &[State], capacity: usize) -> usize {
+    // Include spare slots but classify shared frontiers separately: observing
+    // their full payload does not mean this source can reclaim it exclusively.
+    states.iter().fold(
+        capacity.saturating_mul(size_of::<State>()),
         |bytes, state| {
             bytes
                 .saturating_add(state.d.capacity().saturating_mul(size_of::<u32>()))

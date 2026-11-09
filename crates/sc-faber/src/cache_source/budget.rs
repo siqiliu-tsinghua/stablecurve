@@ -25,6 +25,147 @@ use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
 
+/// The storage worker calls this only at its bounded pressure-poll boundary,
+/// after releasing source locks. Freeing a payload can leave its pages in GNU
+/// malloc's arenas, so native anonymous usage may otherwise never fall enough
+/// for the next reservation. This is best effort, not budget credit or proof of
+/// reclamation; later admission still uses a fresh native observation.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn release_allocator_pages() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> std::ffi::c_int;
+    }
+    // SAFETY: GNU malloc_trim is thread-safe and only returns unused pages
+    // from its own allocator. It has no pointer or ownership preconditions.
+    // https://man7.org/linux/man-pages/man3/malloc_trim.3.html
+    let _ = unsafe { malloc_trim(0) };
+}
+
+/// Diagnostic counters from one cgroup's memory.stat. These fields overlap:
+/// file includes shmem, and inactive_file is an LRU classification, not extra
+/// free capacity. None means absent or malformed, rather than zero usage.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CgroupMemoryStat {
+    pub(crate) hierarchical: Option<bool>,
+    /// v2 anon, or v1 rss, with the controller's own accounting semantics.
+    pub(crate) anonymous_bytes: Option<u64>,
+    pub(crate) file_bytes: Option<u64>,
+    pub(crate) inactive_file_bytes: Option<u64>,
+    pub(crate) dirty_file_bytes: Option<u64>,
+    pub(crate) writeback_file_bytes: Option<u64>,
+    pub(crate) slab_reclaimable_bytes: Option<u64>,
+    pub(crate) shared_memory_bytes: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl fmt::Debug for CgroupMemoryStat {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("CgroupMemoryStat")
+            .field("hierarchical", &self.hierarchical)
+            .field("anonymous_bytes", &self.anonymous_bytes)
+            .field("file_bytes", &self.file_bytes)
+            .field("inactive_file_bytes", &self.inactive_file_bytes)
+            .field("dirty_file_bytes", &self.dirty_file_bytes)
+            .field("writeback_file_bytes", &self.writeback_file_bytes)
+            .field("slab_reclaimable_bytes", &self.slab_reclaimable_bytes)
+            .field("shared_memory_bytes", &self.shared_memory_bytes)
+            .finish()
+    }
+}
+
+/// Usage and breakdown belong to the same visible ancestor. The minimum
+/// cgroup limit and the minimum headroom need not come from the same ancestor.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
+pub(crate) struct CgroupObservation {
+    pub(crate) controller: &'static str,
+    pub(crate) ancestor_depth: usize,
+    pub(crate) usage_bytes: u64,
+    pub(crate) limit_bytes: Option<u64>,
+    pub(crate) stat: CgroupMemoryStat,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl fmt::Debug for CgroupObservation {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output
+            .debug_struct("CgroupObservation")
+            .field("controller", &self.controller)
+            .field("ancestor_depth", &self.ancestor_depth)
+            .field("usage_bytes", &self.usage_bytes)
+            .field("limit_bytes", &self.limit_bytes)
+            .field("stat", &self.stat)
+            .finish()
+    }
+}
+
+// Key-based parsing follows the kernel's cgroup memory interface. v2 amounts
+// are bytes; v1 total_* counters include descendants, unlike local counters.
+// https://docs.kernel.org/admin-guide/cgroup-v2.html#memory
+// https://docs.kernel.org/admin-guide/cgroup-v1/memory.html#stat-file
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_stat(text: &str, unified: bool) -> CgroupMemoryStat {
+    #[derive(Clone, Copy, Default)]
+    struct Counter {
+        seen: bool,
+        value: Option<u64>,
+    }
+    let mut local = [Counter::default(); 7];
+    let mut total = [Counter::default(); 7];
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else { continue };
+        let (hierarchical, key) = if !unified {
+            key.strip_prefix("total_")
+                .map_or((false, key), |key| (true, key))
+        } else {
+            (false, key)
+        };
+        let index = match (unified, key) {
+            (true, "anon") | (false, "rss") => 0,
+            (true, "file") | (false, "cache") => 1,
+            (_, "inactive_file") => 2,
+            (true, "file_dirty") | (false, "dirty") => 3,
+            (true, "file_writeback") | (false, "writeback") => 4,
+            (_, "slab_reclaimable") => 5,
+            (_, "shmem") => 6,
+            _ => continue,
+        };
+        let counter = if hierarchical {
+            &mut total[index]
+        } else {
+            &mut local[index]
+        };
+        // Reject only this diagnostic counter. Unknown future keys and bad
+        // optional values never turn a valid memory limit into a failed check.
+        let value = fields.next().and_then(|value| value.parse().ok());
+        counter.value = if counter.seen || fields.next().is_some() {
+            None
+        } else {
+            value
+        };
+        counter.seen = true;
+    }
+    let totals_present = total.iter().any(|counter| counter.seen);
+    let counters = if totals_present { &total } else { &local };
+    let hierarchical = counters
+        .iter()
+        .any(|counter| counter.seen)
+        .then_some(unified || totals_present);
+    CgroupMemoryStat {
+        hierarchical,
+        anonymous_bytes: counters[0].value,
+        file_bytes: counters[1].value,
+        inactive_file_bytes: counters[2].value,
+        dirty_file_bytes: counters[3].value,
+        writeback_file_bytes: counters[4].value,
+        slab_reclaimable_bytes: counters[5].value,
+        shared_memory_bytes: counters[6].value,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateMemoryKind {
     /// Windows PROCESS_MEMORY_COUNTERS_EX::PrivateUsage.
@@ -53,6 +194,9 @@ pub(crate) struct MemorySnapshot {
     pub(crate) commit_limit_enforced: bool,
     pub(crate) cgroup_headroom_bytes: Option<u64>,
     pub(crate) cgroup_limit_bytes: Option<u64>,
+    /// Diagnostic only; never counted as additional available capacity.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) cgroup_observation: Option<CgroupObservation>,
     pub(crate) job_process_limit_bytes: Option<u64>,
     #[cfg(any(target_os = "windows", test))]
     pub(crate) job_memory_limit_bytes: Option<u64>,
@@ -80,6 +224,8 @@ impl MemorySnapshot {
             commit_limit_enforced: false,
             cgroup_headroom_bytes: None,
             cgroup_limit_bytes: None,
+            #[cfg(any(target_os = "linux", test))]
+            cgroup_observation: None,
             job_process_limit_bytes: None,
             #[cfg(any(target_os = "windows", test))]
             job_memory_limit_bytes: None,
@@ -1179,7 +1325,10 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{MemorySnapshot, PrivateMemoryKind, minimum};
+    use super::{
+        CgroupMemoryStat, CgroupObservation, MemorySnapshot, PrivateMemoryKind, minimum,
+        parse_cgroup_memory_stat,
+    };
     use std::ffi::OsString;
     use std::fs;
     use std::io::ErrorKind;
@@ -1223,6 +1372,7 @@ mod platform {
         let cgroup = cgroup_memory();
         snapshot.cgroup_headroom_bytes = cgroup.headroom;
         snapshot.cgroup_limit_bytes = cgroup.limit;
+        snapshot.cgroup_observation = cgroup.observation;
         snapshot.environment_limits_checked = cgroup.checked && overcommit.is_some();
         snapshot
     }
@@ -1231,6 +1381,7 @@ mod platform {
     struct CgroupMemory {
         headroom: Option<u64>,
         limit: Option<u64>,
+        observation: Option<CgroupObservation>,
         checked: bool,
     }
 
@@ -1303,7 +1454,8 @@ mod platform {
         if !directory.is_dir() {
             return CgroupMemory::default();
         }
-        for ancestor in directory.ancestors() {
+        let mut observation_directory = None;
+        for (ancestor_depth, ancestor) in directory.ancestors().enumerate() {
             if !ancestor.starts_with(mount) {
                 break;
             }
@@ -1312,13 +1464,38 @@ mod platform {
             match (limit, usage) {
                 (Ok(limit), Ok(usage)) => {
                     if unified && limit.trim() == "max" {
+                        // Keep a leaf observation for an unlimited hierarchy,
+                        // but a finite ancestor below replaces it. Diagnostics
+                        // never make a previously valid limit check fail.
+                        if let (None, Ok(usage_bytes)) =
+                            (result.observation, usage.trim().parse::<u64>())
+                        {
+                            result.observation = Some(CgroupObservation {
+                                controller: "v2",
+                                ancestor_depth,
+                                usage_bytes,
+                                limit_bytes: None,
+                                stat: CgroupMemoryStat::default(),
+                            });
+                            observation_directory = Some(ancestor.to_path_buf());
+                        }
                         continue;
                     }
                     match (limit.trim().parse::<u64>(), usage.trim().parse::<u64>()) {
                         (Ok(limit), Ok(used)) => {
+                            let headroom = limit.saturating_sub(used);
+                            if result.headroom.is_none_or(|previous| headroom < previous) {
+                                result.observation = Some(CgroupObservation {
+                                    controller: if unified { "v2" } else { "v1" },
+                                    ancestor_depth,
+                                    usage_bytes: used,
+                                    limit_bytes: Some(limit),
+                                    stat: CgroupMemoryStat::default(),
+                                });
+                                observation_directory = Some(ancestor.to_path_buf());
+                            }
                             result.limit = minimum(result.limit, Some(limit));
-                            result.headroom =
-                                minimum(result.headroom, Some(limit.saturating_sub(used)));
+                            result.headroom = minimum(result.headroom, Some(headroom));
                         }
                         _ => result.checked = false,
                     }
@@ -1333,6 +1510,16 @@ mod platform {
             }
             if ancestor == mount {
                 break;
+            }
+        }
+        if let (Some(observation), Some(directory)) =
+            (&mut result.observation, observation_directory)
+        {
+            // Sampling already runs off the normal cached-check path. Read
+            // only the selected ancestor's optional breakdown, after choosing
+            // its usage/headroom; missing statistics do not alter admission.
+            if let Ok(stat) = fs::read_to_string(directory.join("memory.stat")) {
+                observation.stat = parse_cgroup_memory_stat(&stat, unified);
             }
         }
         result
@@ -1392,6 +1579,15 @@ mod platform {
                     continue;
                 };
                 let observed = inspect_hierarchy(&directory, &mount, unified);
+                let replace_observation = match (observed.headroom, result.headroom) {
+                    (Some(observed), Some(current)) => observed < current,
+                    (Some(_), None) => true,
+                    (None, None) => result.observation.is_none(),
+                    (None, Some(_)) => false,
+                };
+                if replace_observation {
+                    result.observation = observed.observation;
+                }
                 result.limit = minimum(result.limit, observed.limit);
                 result.headroom = minimum(result.headroom, observed.headroom);
                 result.checked &= observed.checked;
@@ -1561,6 +1757,69 @@ mod platform {
         let mountinfo = format!("{unrelated_line}{current_line}");
         assert!(!cgroup_memory_from_proc(membership, &mountinfo).checked);
     }
+
+    #[cfg(test)]
+    #[test]
+    fn statistics_belong_to_the_ancestor_limiting_headroom() {
+        let hierarchy = test_hierarchy();
+        let mount = &hierarchy.0;
+        let child = mount.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(mount.join("memory.max"), "100\n").unwrap();
+        fs::write(mount.join("memory.current"), "20\n").unwrap();
+        fs::write(mount.join("memory.stat"), "anon 10\nfile 10\n").unwrap();
+        fs::write(child.join("memory.max"), "200\n").unwrap();
+        fs::write(child.join("memory.current"), "195\n").unwrap();
+        fs::write(child.join("memory.stat"), "anon 150\nfile 45\n").unwrap();
+        let observed = inspect_hierarchy(&child, mount, true);
+        assert!(observed.checked);
+        assert_eq!(observed.limit, Some(100));
+        assert_eq!(observed.headroom, Some(5));
+        let detail = observed.observation.unwrap();
+        assert_eq!(detail.limit_bytes, Some(200));
+        assert_eq!(detail.usage_bytes, 195);
+        assert_eq!(detail.ancestor_depth, 0);
+        assert_eq!(detail.stat.anonymous_bytes, Some(150));
+        assert_eq!(detail.stat.file_bytes, Some(45));
+
+        fs::write(mount.join("memory.current"), "98\n").unwrap();
+        fs::write(mount.join("memory.stat"), "anon 60\nfile 38\n").unwrap();
+        let observed = inspect_hierarchy(&child, mount, true);
+        assert!(observed.checked);
+        assert_eq!(observed.headroom, Some(2));
+        let detail = observed.observation.unwrap();
+        assert_eq!(detail.limit_bytes, Some(100));
+        assert_eq!(detail.usage_bytes, 98);
+        assert_eq!(detail.ancestor_depth, 1);
+        assert_eq!(detail.stat.anonymous_bytes, Some(60));
+        assert_eq!(detail.stat.file_bytes, Some(38));
+
+        fs::remove_file(mount.join("memory.stat")).unwrap();
+        let observed = inspect_hierarchy(&child, mount, true);
+        assert!(observed.checked);
+        assert_eq!(observed.headroom, Some(2));
+        assert!(observed.observation.unwrap().stat.anonymous_bytes.is_none());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn unlimited_groups_still_offer_optional_diagnostics() {
+        let hierarchy = test_hierarchy();
+        let mount = &hierarchy.0;
+        fs::create_dir_all(mount).unwrap();
+        fs::write(mount.join("memory.max"), "max\n").unwrap();
+        fs::write(mount.join("memory.current"), "30\n").unwrap();
+        fs::write(mount.join("memory.stat"), "anon invalid\nfile 20\n").unwrap();
+        let observed = inspect_hierarchy(mount, mount, true);
+        assert!(observed.checked);
+        assert_eq!(observed.limit, None);
+        assert_eq!(observed.headroom, None);
+        let detail = observed.observation.unwrap();
+        assert_eq!(detail.limit_bytes, None);
+        assert_eq!(detail.usage_bytes, 30);
+        assert_eq!(detail.stat.anonymous_bytes, None);
+        assert_eq!(detail.stat.file_bytes, Some(20));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1581,6 +1840,97 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_v2_statistics_use_named_byte_counters_without_adding_overlaps() {
+        let observed = parse_cgroup_memory_stat(
+            "file 600\nnew_kernel_counter 987\nfile_writeback 30\n\
+             anon 100\ninactive_file 400\nfile_dirty 200\n\
+             slab_reclaimable 10\nshmem 25\n",
+            true,
+        );
+        assert_eq!(observed.hierarchical, Some(true));
+        assert_eq!(observed.anonymous_bytes, Some(100));
+        assert_eq!(observed.file_bytes, Some(600));
+        assert_eq!(observed.inactive_file_bytes, Some(400));
+        assert_eq!(observed.dirty_file_bytes, Some(200));
+        assert_eq!(observed.writeback_file_bytes, Some(30));
+        assert_eq!(observed.slab_reclaimable_bytes, Some(10));
+        assert_eq!(observed.shared_memory_bytes, Some(25));
+    }
+
+    #[test]
+    fn cgroup_v1_statistics_choose_one_consistent_hierarchical_scope() {
+        let local = "rss 7\ncache 8\ninactive_file 5\ndirty 0\nwriteback 1\n";
+        let observed = parse_cgroup_memory_stat(local, false);
+        assert_eq!(observed.hierarchical, Some(false));
+        assert_eq!(observed.anonymous_bytes, Some(7));
+        assert_eq!(observed.file_bytes, Some(8));
+        assert_eq!(observed.dirty_file_bytes, Some(0));
+        let observed = parse_cgroup_memory_stat(
+            &format!("{local}total_rss 70\ntotal_cache 80\ntotal_inactive_file 50\n"),
+            false,
+        );
+        assert_eq!(observed.hierarchical, Some(true));
+        assert_eq!(observed.anonymous_bytes, Some(70));
+        assert_eq!(observed.file_bytes, Some(80));
+        assert_eq!(observed.inactive_file_bytes, Some(50));
+        // Do not combine descendant totals with a local-only dirty counter.
+        assert_eq!(observed.dirty_file_bytes, None);
+        assert_eq!(observed.writeback_file_bytes, None);
+        let malformed = parse_cgroup_memory_stat(
+            &format!("{local}total_rss invalid\ntotal_cache 80\n"),
+            false,
+        );
+        assert_eq!(malformed.anonymous_bytes, None);
+        assert_eq!(malformed.file_bytes, Some(80));
+    }
+
+    #[test]
+    fn missing_or_malformed_optional_statistics_remain_unknown() {
+        let missing = parse_cgroup_memory_stat("future_counter 123\n", true);
+        assert_eq!(missing.hierarchical, None);
+        assert_eq!(missing.anonymous_bytes, None);
+        assert_eq!(missing.file_bytes, None);
+        let observed = parse_cgroup_memory_stat(
+            "anon -1\nfile 1\nfile 2\ninactive_file 12 bytes\nfile_dirty\n\
+             file_writeback 18446744073709551616\nslab_reclaimable 0\n",
+            true,
+        );
+        assert_eq!(observed.anonymous_bytes, None);
+        assert_eq!(observed.file_bytes, None);
+        assert_eq!(observed.inactive_file_bytes, None);
+        assert_eq!(observed.dirty_file_bytes, None);
+        assert_eq!(observed.writeback_file_bytes, None);
+        assert_eq!(observed.slab_reclaimable_bytes, Some(0));
+    }
+
+    #[test]
+    fn cgroup_breakdowns_do_not_change_admission_or_reported_headroom() {
+        let mut observation = sample(300, 10_000);
+        observation.cgroup_headroom_bytes = Some(600);
+        observation.cgroup_limit_bytes = Some(900);
+        let without = Budget::new(config(), observation).unwrap().check(100);
+        observation.cgroup_observation = Some(CgroupObservation {
+            controller: "v2",
+            ancestor_depth: 2,
+            usage_bytes: 300,
+            limit_bytes: Some(900),
+            stat: parse_cgroup_memory_stat(
+                "anon 100\nfile 200\ninactive_file 190\nslab_reclaimable 5000\n",
+                true,
+            ),
+        });
+        let with = Budget::new(config(), observation).unwrap().check(100);
+        assert_eq!(with.limits, without.limits);
+        assert_eq!(with.pressure, without.pressure);
+        assert_eq!(
+            with.projected_private_bytes,
+            without.projected_private_bytes
+        );
+        assert_eq!(with.reclaim_bytes, without.reclaim_bytes);
+        assert_eq!(with.memory.cgroup_headroom_bytes, Some(600));
+    }
 
     fn reservation_budget() -> Budget {
         let mut policy = config();

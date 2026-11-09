@@ -1284,6 +1284,7 @@ mod tests {
             commit_limit_enforced: false,
             cgroup_headroom_bytes: None,
             cgroup_limit_bytes: None,
+            cgroup_observation: None,
             job_process_limit_bytes: None,
             job_memory_limit_bytes: None,
             job_headroom_bytes: None,

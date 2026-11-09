@@ -1831,17 +1831,32 @@ mod tests {
         workspace.stored(0).unwrap();
         drop(work);
         assert!(workspace.reclaim_stored(usize::MAX) > 0);
+        let cancel_queued_read = || {
+            let retry_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let before = workspace.lock().progress_epoch;
+                let error = workspace
+                    .block_inner(0, None, Instant::now() + Duration::from_millis(1))
+                    .err()
+                    .unwrap();
+                assert!(error.contains("resource deadline"));
+                let state = workspace.lock();
+                assert!(!state.slots[0].requested);
+                assert_eq!(state.slots[0].waiters.load(Ordering::Acquire), 0);
+                if state.progress_epoch == before {
+                    // Scheduling can consume 1 ms before the request is even
+                    // enqueued. Exercise an actual request/cancellation cycle
+                    // before asserting its retained queue entry.
+                    assert!(Instant::now() < retry_deadline, "request never enqueued");
+                    continue;
+                }
+                assert_eq!(state.loads.len(), 1);
+                assert!(state.slots[0].load_queued);
+                break;
+            }
+        };
         for _ in 0..3 {
-            let error = workspace
-                .block_inner(0, None, Instant::now() + Duration::from_millis(1))
-                .err()
-                .unwrap();
-            assert!(error.contains("resource deadline"));
-            let state = workspace.lock();
-            assert_eq!(state.loads.len(), 1);
-            assert!(state.slots[0].load_queued);
-            assert!(!state.slots[0].requested);
-            assert_eq!(state.slots[0].waiters.load(Ordering::Acquire), 0);
+            cancel_queued_read();
         }
         let waiting = workspace.clone();
         let client = std::thread::spawn(move || waiting.block(0));
@@ -1853,11 +1868,7 @@ mod tests {
         assert_eq!(workspace.reclaim_stored(usize::MAX), 0);
         drop(loaded);
         assert!(workspace.reclaim_stored(usize::MAX) > 0);
-        assert!(
-            workspace
-                .block_inner(0, None, Instant::now() + Duration::from_millis(1))
-                .is_err()
-        );
+        cancel_queued_read();
         assert!(workspace.next_load().is_none());
         {
             let state = workspace.lock();
@@ -1866,11 +1877,7 @@ mod tests {
             assert!(!state.slots[0].load_queued);
             assert!(!state.slots[0].eviction_queued);
         }
-        assert!(
-            workspace
-                .block_inner(0, None, Instant::now() + Duration::from_millis(1))
-                .is_err()
-        );
+        cancel_queued_read();
         workspace.fail("stop queued load".into());
         {
             let state = workspace.lock();

@@ -388,10 +388,39 @@ fn evaluate_terms(constant: &Q, terms: &[Term], divisor: Option<&Q>, values: &[Q
 
 #[derive(Default)]
 struct PackedEquation {
-    constant: Q,
-    divisor: Option<Q>,
+    // Most GRR equations have zero constant and no divisor. Keep these sparse
+    // scalars out of the contiguous per-state directory without narrowing Q.
+    constant: Option<Box<Q>>,
+    divisor: Option<Box<Q>>,
     block: usize,
     terms: std::ops::Range<usize>,
+}
+
+impl PackedEquation {
+    fn new(constant: Q, divisor: Option<Q>, block: usize, terms: std::ops::Range<usize>) -> Self {
+        let nonzero = constant != Q::ZERO;
+        let boxes = usize::from(nonzero) + usize::from(divisor.is_some());
+        if boxes != 0 {
+            // Q's existing limb payload is moved, not copied. The new boxes
+            // need their own capacity and conservative allocator overhead.
+            pressure::reallocation(boxes * (std::mem::size_of::<Q>() + 16));
+        }
+        Self {
+            constant: nonzero.then(|| Box::new(constant)),
+            divisor: divisor.map(Box::new),
+            block,
+            terms,
+        }
+    }
+
+    fn constant(&self) -> &Q {
+        static ZERO: Q = Q::ZERO;
+        self.constant.as_deref().unwrap_or(&ZERO)
+    }
+
+    fn divisor(&self) -> Option<&Q> {
+        self.divisor.as_deref()
+    }
 }
 
 #[derive(Default)]
@@ -425,8 +454,8 @@ impl Plan {
         let equation = &self.equations[id];
         self.terms[equation.block].evaluate(
             equation.terms.clone(),
-            &equation.constant,
-            equation.divisor.as_ref(),
+            equation.constant(),
+            equation.divisor(),
             values,
         )
     }
@@ -699,7 +728,7 @@ fn integrate_engine(
         pressure::back_plan(&mut plan, registry.unwrap());
     }
     #[cfg(test)]
-    measurement.resized();
+    measurement.resized(engine);
     #[cfg(test)]
     let start = std::time::Instant::now();
     if let Some(source) = &source {
@@ -760,7 +789,7 @@ fn integrate_engine(
         measure::reevaluate_same_plan(&mut plan, &mut engine.values, base, threads);
     }
     #[cfg(test)]
-    measurement.evaluated(engine);
+    measurement.evaluated(engine, &plan);
     // 连续块分摊给工作线程释放，大有理数系数也在这里析构。
     if !plan.terms.is_empty() {
         let chunk = plan.terms.len().div_ceil(threads.max(1));
@@ -1209,12 +1238,7 @@ impl Planner<'_> {
             equations.push((
                 state.index,
                 state.rank,
-                PackedEquation {
-                    constant: equation.constant,
-                    divisor: equation.divisor,
-                    block: 0,
-                    terms: start..terms.len(),
-                },
+                PackedEquation::new(equation.constant, equation.divisor, 0, start..terms.len()),
             ));
         }
         terms.shrink_to_fit();
@@ -1260,12 +1284,7 @@ impl Planner<'_> {
             equations.push((
                 state.index,
                 state.rank,
-                PackedEquation {
-                    constant: equation.constant,
-                    divisor: equation.divisor,
-                    block: 0,
-                    terms: start..terms.len(),
-                },
+                PackedEquation::new(equation.constant, equation.divisor, 0, start..terms.len()),
             ));
         }
         terms.shrink_to_fit();
@@ -2345,6 +2364,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_equation_scalars_preserve_zero_and_large_exact_rationals() {
+        let zero = PackedEquation::default();
+        assert!(zero.constant.is_none());
+        assert!(zero.divisor.is_none());
+        assert_eq!(*zero.constant(), Q::ZERO);
+        assert_eq!(
+            std::mem::size_of::<PackedEquation>(),
+            5 * std::mem::size_of::<usize>()
+        );
+        let large = sc_num::pow_unsigned(&Q::from(2), 257) / Q::from(31);
+        let divisor = &large + Q::ONE;
+        let equation = PackedEquation::new(-&large, Some(divisor.clone()), 0, 0..0);
+        assert_eq!(*equation.constant(), -&large);
+        assert_eq!(equation.divisor(), Some(&divisor));
+        let mut plan = Plan::default();
+        plan.equations.push(equation);
+        plan.terms.push(TermBlock::default());
+        assert_eq!(plan.evaluate(0, &[]), -large / divisor);
+        let one = PackedEquation::new(Q::ZERO, Some(Q::ONE), 0, 0..0);
+        assert!(one.constant.is_none());
+        assert_eq!(one.divisor(), Some(&Q::ONE));
+    }
+
+    #[test]
     fn engine_use_permit_survives_table_borrows_and_releases_on_unwind() {
         use crate::cache_source::ResultSource;
         for panic in [false, true] {
@@ -2804,8 +2847,8 @@ mod tests {
             assert_eq!(
                 built.terms.evaluate(
                     equation.terms.clone(),
-                    &equation.constant,
-                    equation.divisor.as_ref(),
+                    equation.constant(),
+                    equation.divisor(),
                     &[],
                 ),
                 expected

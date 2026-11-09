@@ -103,6 +103,9 @@ pub(crate) struct StorageReport {
     pub(crate) last_settled_reserved_bytes: u64,
     pub(crate) last_sample_generation: u64,
     pub(crate) reclaimed_bytes: usize,
+    /// GNU allocator page-return attempts by the pressure worker, not credit.
+    pub(crate) allocator_trim_calls: usize,
+    pub(crate) allocator_trim_ns: u128,
     pub(crate) work_written_blocks: usize,
     pub(crate) work_written_bytes: u64,
     pub(crate) work_commits: usize,
@@ -166,6 +169,8 @@ impl fmt::Debug for StorageReport {
             )
             .field("last_sample_generation", &self.last_sample_generation)
             .field("reclaimed_bytes", &self.reclaimed_bytes)
+            .field("allocator_trim_calls", &self.allocator_trim_calls)
+            .field("allocator_trim_ns", &self.allocator_trim_ns)
             .field("work_written_blocks", &self.work_written_blocks)
             .field("work_written_bytes", &self.work_written_bytes)
             .field("work_commits", &self.work_commits)
@@ -1098,6 +1103,20 @@ impl Worker {
         self.commit()?;
         let registry = Arc::clone(&self.registry);
         self.reclaim_sources(&registry);
+        // GNU malloc may retain pages of already-dropped keys or term blocks.
+        // Run only here, off the computation threads and at most every 100 ms
+        // under pressure. All source guards from reclaim_sources are gone.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        if matches!(budget.check(0).pressure, Pressure::Warning | Pressure::Hard) {
+            let started = Instant::now();
+            super::budget::release_allocator_pages();
+            self.report.allocator_trim_calls = self.report.allocator_trim_calls.saturating_add(1);
+            self.report.allocator_trim_ns = self
+                .report
+                .allocator_trim_ns
+                .saturating_add(started.elapsed().as_nanos());
+            self.record_memory(budget.force_check(0));
+        }
         Ok(())
     }
 

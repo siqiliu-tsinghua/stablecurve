@@ -85,6 +85,10 @@ Each genus produces `target/hodge-data/hodge_data_gG.sage`. The example guide
 documents genus selection, threads, memory budgets, output paths and resuming.
 Generated data and SQLite caches are local outputs, separate from the source.
 
+Choose a memory budget appropriate to the workload; SQLite persistence does not
+guarantee completion under arbitrarily low budgets. See the
+[cache design scope](docs/FABER_CACHE_DESIGN.md#16-2026-11-09本轮范围收口).
+
 The files use the same `hodge_number[(lambda indices)]` assignment format as
 [admcycles' precomputed Hodge table](https://gitlab.com/modulispaces/admcycles/-/blob/master/README.rst).
 In a **SageMath session**, load a file into a new or existing table:

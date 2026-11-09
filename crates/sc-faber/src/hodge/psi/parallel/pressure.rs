@@ -8,7 +8,8 @@
 use super::workspace::PlanWorkspace;
 use super::{Batch, PackedEquation, ParallelSource, Plan, State, TermBlock};
 use crate::cache_source::budget::{
-    Budget, Pressure, Reservation, ReservationError, ReservationKind, process_budget,
+    Budget, BudgetDecision, Pressure, Reservation, ReservationError, ReservationKind,
+    process_budget,
 };
 use crate::cache_source::{Registry, resource_failure};
 use sc_num::{Q, Zero};
@@ -90,6 +91,289 @@ fn initial_reservation(
         ),
         error => failure(context, error),
     })
+}
+
+// One group shares the refresh across shrinking candidates. Stale observations
+// may still request a newer sample; a genuine fresh denial alone can shrink it.
+fn evaluation_admission<T>(
+    refreshed: &mut bool,
+    mut attempt: impl FnMut() -> Result<T, ReservationError>,
+    mut refresh: impl FnMut(),
+    mut pause: impl FnMut(),
+    mut elapsed: impl FnMut() -> Duration,
+) -> Result<T, ReservationError> {
+    let result = retry_initial_reservation(
+        &mut attempt,
+        || {
+            *refreshed = true;
+            refresh();
+        },
+        &mut pause,
+        &mut elapsed,
+        PROGRESS_TIMEOUT,
+    );
+    if !*refreshed
+        && matches!(
+            &result,
+            Err(ReservationError::Pressure { .. } | ReservationError::Unavailable)
+        )
+    {
+        *refreshed = true;
+        refresh();
+        return retry_initial_reservation(attempt, refresh, pause, elapsed, PROGRESS_TIMEOUT);
+    }
+    result
+}
+
+fn evaluation_reserve<T>(
+    budget: &Budget,
+    refreshed: &mut bool,
+    attempt: impl FnMut() -> Result<T, ReservationError>,
+) -> Result<T, ReservationError> {
+    // A group may have spent longer than 30 seconds waiting for real spill
+    // progress. Only a new transient failure starts this independent clock.
+    let mut transient_since: Option<Instant> = None;
+    evaluation_admission(
+        refreshed,
+        attempt,
+        || {
+            budget.force_check(0);
+        },
+        || std::thread::park_timeout(Duration::from_millis(1)),
+        || transient_since.get_or_insert_with(Instant::now).elapsed(),
+    )
+}
+
+fn capacity_denial(error: &ReservationError) -> bool {
+    matches!(error, ReservationError::Pressure { .. })
+}
+
+// Match Budget's Compute approval, including the inclusive computation limit.
+// This observation grants no credit: the caller must retry its atomic reserve.
+fn compute_fits(decision: &BudgetDecision) -> bool {
+    !decision.stale
+        && !decision.arithmetic_overflow
+        && decision.observations_complete
+        && decision
+            .projected_private_bytes
+            .zip(decision.limits)
+            .is_some_and(|(projected, limits)| projected <= limits.computation_max_bytes)
+}
+
+#[cfg(test)]
+mod evaluation_admission_tests {
+    use super::*;
+    use crate::cache_source::budget::{BudgetConfig, MemorySnapshot};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    fn pressure() -> ReservationError {
+        ReservationError::Pressure {
+            pressure: Pressure::Hard,
+            projected: Some(1024),
+            limits: None,
+        }
+    }
+
+    fn budget() -> Budget {
+        Budget::for_test(
+            BudgetConfig {
+                max_bytes: Some(1000),
+                system_headroom_bytes: 0,
+                progress_reserve_bytes: 32,
+                sample_interval: Duration::from_secs(60),
+                ..BudgetConfig::default()
+            },
+            MemorySnapshot {
+                captured_at: Instant::now(),
+                process_private_bytes: Some(64),
+                process_peak_commit_bytes: None,
+                process_private_kind: None,
+                process_resident_bytes: None,
+                total_physical_bytes: Some(20_000),
+                available_physical_bytes: Some(10_000),
+                commit_headroom_bytes: None,
+                commit_limit_enforced: false,
+                cgroup_headroom_bytes: None,
+                cgroup_limit_bytes: None,
+                cgroup_observation: None,
+                job_process_limit_bytes: None,
+                job_memory_limit_bytes: None,
+                job_headroom_bytes: None,
+                job_headroom_peak_based: false,
+                environment_limits_checked: true,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_fitting_request_can_skip_reclaim_even_at_the_compute_limit() {
+        let budget = budget();
+        let mut decision = budget.check(904);
+        // Pressure is Hard at equality, but Compute's actual atomic approval
+        // accepts equality. Warning/hysteresis alone must not force a wait.
+        assert_eq!(decision.pressure, Pressure::Hard);
+        assert!(compute_fits(&decision));
+        let credit = budget.try_reserve(904, ReservationKind::Compute).unwrap();
+        drop(credit);
+        assert!(!compute_fits(&budget.check(905)));
+        decision.stale = true;
+        assert!(!compute_fits(&decision));
+        decision.stale = false;
+        decision.observations_complete = false;
+        assert!(!compute_fits(&decision));
+        decision.observations_complete = true;
+        decision.arithmetic_overflow = true;
+        assert!(!compute_fits(&decision));
+    }
+
+    #[test]
+    fn rejected_future_outputs_leave_only_allocated_metadata_liability() {
+        let budget = budget();
+        let metadata = budget.try_reserve(200, ReservationKind::Compute).unwrap();
+        metadata.start().unwrap();
+        assert!(capacity_denial(&metadata.ensure(1200).unwrap_err()));
+        assert_eq!(metadata.reserved_bytes(), 200);
+        drop(metadata);
+        let decision = budget.check(0);
+        assert_eq!(decision.active_reserved_bytes, 0);
+        assert_eq!(decision.settled_reserved_bytes, 200);
+    }
+
+    #[test]
+    fn fresh_success_and_fatal_errors_do_not_refresh_or_wait() {
+        assert_eq!(
+            evaluation_admission(
+                &mut false,
+                || Ok(17usize),
+                || panic!("fresh success sampled memory"),
+                || panic!("fresh success waited"),
+                || panic!("fresh success started a clock"),
+            )
+            .unwrap(),
+            17
+        );
+        for error in [
+            ReservationError::Overflow,
+            ReservationError::Finished,
+            ReservationError::AlreadyStarted,
+            ReservationError::WouldGrow {
+                reserved: 1,
+                required: 2,
+            },
+            ReservationError::Underestimated {
+                reserved: 1,
+                measured: 2,
+            },
+        ] {
+            let mut error = Some(error);
+            let result = evaluation_admission::<usize>(
+                &mut false,
+                || Err(error.take().expect("fatal error was retried")),
+                || panic!("fatal error sampled memory"),
+                || panic!("fatal error waited"),
+                || panic!("fatal error started a clock"),
+            );
+            assert!(!capacity_denial(&result.unwrap_err()));
+        }
+    }
+
+    #[test]
+    fn a_fresh_observation_retries_the_original_request_before_shrinking() {
+        let mut attempts = VecDeque::from([Err(pressure()), Ok(23usize)]);
+        let refreshes = Cell::new(0);
+        let mut refreshed = false;
+        assert_eq!(
+            evaluation_admission(
+                &mut refreshed,
+                || attempts.pop_front().expect("extra attempt"),
+                || refreshes.set(refreshes.get() + 1),
+                || panic!("successful fresh retry waited"),
+                || panic!("successful fresh retry started a clock"),
+            )
+            .unwrap(),
+            23
+        );
+        assert!(attempts.is_empty());
+        assert!(refreshed);
+        assert_eq!(refreshes.get(), 1);
+    }
+
+    #[test]
+    fn genuine_pressure_shares_one_refresh_across_smaller_candidates() {
+        let refreshes = Cell::new(0);
+        let mut refreshed = false;
+        for _ in 0..4 {
+            assert!(capacity_denial(
+                &evaluation_admission::<usize>(
+                    &mut refreshed,
+                    || Err(pressure()),
+                    || refreshes.set(refreshes.get() + 1),
+                    || panic!("pressure classification waited"),
+                    || panic!("pressure classification started a clock"),
+                )
+                .unwrap_err()
+            ));
+        }
+        assert_eq!(refreshes.get(), 1);
+    }
+
+    #[test]
+    fn missing_observations_are_refreshed_once_and_never_shrink() {
+        let refreshes = Cell::new(0);
+        let result = evaluation_admission::<usize>(
+            &mut false,
+            || Err(ReservationError::Unavailable),
+            || refreshes.set(refreshes.get() + 1),
+            || panic!("missing observations waited for block reclamation"),
+            || panic!("missing observations started a clock"),
+        );
+        assert!(matches!(result, Err(ReservationError::Unavailable)));
+        assert_eq!(refreshes.get(), 1);
+    }
+
+    #[test]
+    fn busy_and_stale_retries_keep_the_original_request_and_are_bounded() {
+        let mut attempts = VecDeque::from([
+            Err(ReservationError::Busy),
+            Err(ReservationError::Stale(Duration::from_secs(1))),
+            Ok(29usize),
+        ]);
+        let refreshes = Cell::new(0);
+        let pauses = Cell::new(0);
+        let mut refreshed = false;
+        assert_eq!(
+            evaluation_admission(
+                &mut refreshed,
+                || attempts.pop_front().expect("extra transient attempt"),
+                || refreshes.set(refreshes.get() + 1),
+                || pauses.set(pauses.get() + 1),
+                || Duration::ZERO,
+            )
+            .unwrap(),
+            29
+        );
+        assert!(attempts.is_empty());
+        assert!(refreshed);
+        assert_eq!(refreshes.get(), 1);
+        assert_eq!(pauses.get(), 2);
+
+        let elapsed = Cell::new(0);
+        let result = evaluation_admission::<usize>(
+            &mut false,
+            || Err(ReservationError::Busy),
+            || panic!("busy ledger needs no native sample"),
+            || {},
+            || {
+                let seconds = elapsed.get();
+                elapsed.set(seconds + 15);
+                Duration::from_secs(seconds)
+            },
+        );
+        assert!(matches!(result, Err(ReservationError::Busy)));
+        assert_eq!(elapsed.get(), 45);
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +1060,7 @@ mod adaptive_capacity_tests {
             commit_limit_enforced: false,
             cgroup_headroom_bytes: None,
             cgroup_limit_bytes: None,
+            cgroup_observation: None,
             job_process_limit_bytes: None,
             job_memory_limit_bytes: None,
             job_headroom_bytes: None,
@@ -1085,12 +1370,21 @@ mod reclaim_stall_tests {
 /// I/O deadline on a long spill backlog. Epoch/claim/store activity alone never
 /// extends the stall window. Admission still needs a fresh native observation.
 pub(super) fn retry(workspace: &PlanWorkspace, started: Instant) -> bool {
+    retry_with_request(workspace, started, None)
+}
+
+fn retry_for(workspace: &PlanWorkspace, started: Instant, required: u64) -> bool {
+    retry_with_request(workspace, started, Some(required))
+}
+
+fn retry_with_request(workspace: &PlanWorkspace, started: Instant, required: Option<u64>) -> bool {
     let budget = process_budget();
-    let decision = budget.force_check(0);
-    // Ask for a finite turn. Once admission succeeds, later sealed blocks may
-    // remain resident instead of inheriting an all-future-block drain request.
-    let reclaim = decision.reclaim_bytes.max(32 * 1024 * 1024);
-    workspace.request_reclaim(usize::try_from(reclaim).unwrap_or(usize::MAX));
+    let decision = budget.force_check(required.unwrap_or(0));
+    if required.is_some() && compute_fits(&decision) {
+        // A release or settled-credit absorption may already have made the
+        // original request fit. Atomic admission is still retried by the caller.
+        return true;
+    }
     // These observations must not scan the historical slot directory while
     // holding the source mutex. Detailed payload/pin counts are failure-only.
     let progress = workspace.progress().unwrap_or_else(|error| {
@@ -1102,6 +1396,11 @@ pub(super) fn retry(workspace: &PlanWorkspace, started: Instant) -> bool {
             ),
         )
     });
+    // Observe the epoch before requesting work. A fast reclaimer must not
+    // finish its turn before we capture the epoch and leave us waiting for an
+    // unrelated later change. Only planning lacks an exact request estimate.
+    let reclaim = decision.reclaim_bytes.max(32 * 1024 * 1024);
+    workspace.request_reclaim(usize::try_from(reclaim).unwrap_or(usize::MAX));
     if reclaim_stalled_at(
         started,
         progress.last_reclaimed_at,
@@ -1119,7 +1418,7 @@ pub(super) fn retry(workspace: &PlanWorkspace, started: Instant) -> bool {
             )
         })
     {
-        fail_stalled(workspace);
+        fail_stalled(workspace, required);
     }
     let after = workspace
         .wait_for_progress(progress.progress_epoch, PROGRESS_WAIT)
@@ -1132,7 +1431,7 @@ pub(super) fn retry(workspace: &PlanWorkspace, started: Instant) -> bool {
                 ),
             )
         });
-    budget.force_check(0);
+    budget.force_check(required.unwrap_or(0));
     // This sample grants no credit by itself. The caller retries its original
     // reservation, against native usage and all process-wide liabilities.
     if reclaim_stalled_at(
@@ -1153,13 +1452,13 @@ pub(super) fn retry(workspace: &PlanWorkspace, started: Instant) -> bool {
             )
         })
     {
-        fail_stalled(workspace);
+        fail_stalled(workspace, required);
     }
     true
 }
 
-fn fail_stalled(workspace: &PlanWorkspace) -> ! {
-    let decision = process_budget().check(0);
+fn fail_stalled(workspace: &PlanWorkspace, required: Option<u64>) -> ! {
+    let decision = process_budget().check(required.unwrap_or(0));
     // Count historical slots/pins only when an actual stall is about to fail.
     // A transient Hard observation alone does not justify this full traversal.
     let snapshot = workspace.snapshot();
@@ -1170,14 +1469,14 @@ fn fail_stalled(workspace: &PlanWorkspace) -> ! {
         failure(
             "no resident workspace payload remains to relieve pressure",
             format!(
-                "blocks={}, reclaimed_payload_bytes={}; pressure={decision:?}; workspace={snapshot:?}",
+                "blocks={}, reclaimed_payload_bytes={}, required_bytes={required:?}; pressure={decision:?}; workspace={snapshot:?}",
                 snapshot.blocks, snapshot.reclaimed_bytes
             ),
         );
     }
     failure(
         "workspace made no actual payload reclamation progress for 30 seconds",
-        format!("pressure={decision:?}; workspace={snapshot:?}"),
+        format!("required_bytes={required:?}; pressure={decision:?}; workspace={snapshot:?}"),
     );
 }
 
@@ -1291,6 +1590,178 @@ mod output_memory_tests {
     }
 }
 
+// The previous layer's settled envelope can make a fresh-enough cached sample
+// conservative. Refresh once before committing to the disk-backed evaluator.
+// A Normal first admission retains its original one check and one attempt.
+fn resident_layer_admission<T>(
+    initial: (Pressure, bool),
+    mut refresh: impl FnMut() -> (Pressure, bool),
+    mut attempt: impl FnMut() -> Result<T, ReservationError>,
+) -> Option<T> {
+    let normal = |(pressure, stale): (Pressure, bool)| pressure == Pressure::Normal && !stale;
+    let mut refreshed = false;
+    if !normal(initial) {
+        refreshed = true;
+        if !normal(refresh()) {
+            return None;
+        }
+    }
+    match attempt() {
+        Ok(credit) => Some(credit),
+        Err(error)
+            if !refreshed
+                && matches!(
+                    &error,
+                    ReservationError::Pressure { .. }
+                        | ReservationError::Stale(_)
+                        | ReservationError::Unavailable
+                ) =>
+        {
+            if !normal(refresh()) {
+                return None;
+            }
+            attempt().ok()
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod resident_layer_admission_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    fn denial() -> ReservationError {
+        ReservationError::Pressure {
+            pressure: Pressure::Hard,
+            projected: Some(1024),
+            limits: None,
+        }
+    }
+
+    #[test]
+    fn normal_first_admission_has_no_extra_sample_or_attempt() {
+        let attempts = Cell::new(0);
+        assert_eq!(
+            resident_layer_admission(
+                (Pressure::Normal, false),
+                || panic!("ordinary resident admission sampled memory"),
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Ok(17usize)
+                },
+            ),
+            Some(17)
+        );
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn settled_warning_refreshes_before_unnecessary_backing() {
+        let refreshes = Cell::new(0);
+        let attempts = Cell::new(0);
+        assert_eq!(
+            resident_layer_admission(
+                (Pressure::Warning, false),
+                || {
+                    refreshes.set(refreshes.get() + 1);
+                    (Pressure::Normal, false)
+                },
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Ok(23usize)
+                },
+            ),
+            Some(23)
+        );
+        assert_eq!(refreshes.get(), 1);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn full_output_denial_retries_the_same_request_after_one_sample() {
+        let mut replies = VecDeque::from([Err(denial()), Ok(29usize)]);
+        let mut requests = Vec::new();
+        let refreshes = Cell::new(0);
+        let required = 4096u64;
+        assert_eq!(
+            resident_layer_admission(
+                (Pressure::Normal, false),
+                || {
+                    refreshes.set(refreshes.get() + 1);
+                    (Pressure::Normal, false)
+                },
+                || {
+                    requests.push(required);
+                    replies.pop_front().expect("extra full-layer attempt")
+                },
+            ),
+            Some(29)
+        );
+        assert_eq!(requests, [4096, 4096]);
+        assert_eq!(refreshes.get(), 1);
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn genuine_fresh_pressure_backs_without_repeated_sampling() {
+        for pressure in [Pressure::Warning, Pressure::Hard] {
+            let refreshes = Cell::new(0);
+            assert_eq!(
+                resident_layer_admission::<usize>(
+                    (pressure, false),
+                    || {
+                        refreshes.set(refreshes.get() + 1);
+                        (pressure, false)
+                    },
+                    || panic!("fresh pressure must pause before allocation"),
+                ),
+                None
+            );
+            assert_eq!(refreshes.get(), 1);
+        }
+
+        // Even after a Warning is cleared, an oversized full layer may still
+        // be refused. That is one real fresh denial, not another sample loop.
+        let refreshes = Cell::new(0);
+        let attempts = Cell::new(0);
+        assert_eq!(
+            resident_layer_admission::<usize>(
+                (Pressure::Warning, false),
+                || {
+                    refreshes.set(refreshes.get() + 1);
+                    (Pressure::Normal, false)
+                },
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(denial())
+                },
+            ),
+            None
+        );
+        assert_eq!(refreshes.get(), 1);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn a_still_stale_sample_never_admits_the_resident_layer() {
+        let refreshes = Cell::new(0);
+        assert_eq!(
+            resident_layer_admission::<usize>(
+                (Pressure::Normal, true),
+                || {
+                    refreshes.set(refreshes.get() + 1);
+                    (Pressure::Normal, true)
+                },
+                || panic!("stale sample must not allocate"),
+            ),
+            None
+        );
+        assert_eq!(refreshes.get(), 1);
+    }
+}
+
 pub(super) fn admit_layer(
     outputs: OutputMemory,
     count: usize,
@@ -1298,19 +1769,20 @@ pub(super) fn admit_layer(
     buffered: bool,
 ) -> Option<Reservation> {
     let budget = process_budget();
-    let mut decision = budget.check(0);
-    if decision.stale {
-        decision = budget.force_check(0);
-    }
-    if decision.pressure != Pressure::Normal || decision.stale {
-        return None;
-    }
-    let credit = budget
-        .try_reserve(
-            outputs.estimate(count, workers, buffered),
-            ReservationKind::Compute,
-        )
-        .ok()?;
+    let decision = budget.check(0);
+    let credit = resident_layer_admission(
+        (decision.pressure, decision.stale),
+        || {
+            let decision = budget.force_check(0);
+            (decision.pressure, decision.stale)
+        },
+        || {
+            budget.try_reserve(
+                outputs.estimate(count, workers, buffered),
+                ReservationKind::Compute,
+            )
+        },
+    )?;
     credit.start().ok()?;
     Some(credit)
 }
@@ -1480,6 +1952,10 @@ impl EvaluationProbe {
             decision.sample_generation,
             decision.stale,
         );
+        #[cfg(target_os = "linux")]
+        if let Some(observation) = decision.memory.cgroup_observation {
+            eprintln!("sc-faber: pressure cgroup {observation:?}");
+        }
     }
 }
 
@@ -1563,21 +2039,26 @@ pub(super) fn evaluate_from(
                 probe.begin_group();
             }
             let mut count = group_equations.min(layer.len() - start);
+            let mut refreshed = false;
             let (credit, blocks, mut ids, other_bytes, workers) = loop {
                 if let Some(probe) = &mut probe {
                     probe.attempts = probe.attempts.saturating_add(1);
                 }
-                // Reserve metadata before constructing the bounded block list.
+                // Only metadata is allocated before ensure(total). Reserving
+                // future output/scratch here would charge that unused envelope
+                // as settled each time block admission fails and shrinks.
                 let metadata = bytes(count, 6 * size_of::<usize>() + 1024);
                 let workers = threads.max(1).min(count.div_ceil(32).max(1));
                 let output_bytes = outputs.estimate(count, workers, true);
-                let admission = metadata
-                    .checked_add(output_bytes)
-                    .unwrap_or_else(|| resource_failure("pressure output admission overflow"));
                 let budget = process_budget();
-                let credit = match budget.try_reserve(admission, ReservationKind::Compute) {
+                let credit = match evaluation_reserve(budget, &mut refreshed, || {
+                    budget.try_reserve(metadata, ReservationKind::Compute)
+                }) {
                     Ok(credit) => credit,
                     Err(error) => {
+                        if !capacity_denial(&error) {
+                            failure("pressure evaluation metadata", error);
+                        }
                         if count > 1 {
                             if let Some(probe) = &mut probe {
                                 probe.shrinks = probe.shrinks.saturating_add(1);
@@ -1592,10 +2073,10 @@ pub(super) fn evaluate_from(
                                 start,
                                 count,
                                 "metadata_retry",
-                                admission,
+                                metadata,
                             );
                         }
-                        if retry(workspace, started) {
+                        if retry_for(workspace, started, metadata) {
                             continue;
                         }
                         failure("pressure evaluation metadata", error);
@@ -1626,12 +2107,17 @@ pub(super) fn evaluate_from(
                 let total = other_bytes
                     .checked_add(output_bytes)
                     .unwrap_or_else(|| resource_failure("pressure evaluation admission overflow"));
-                if let Err(error) = credit.ensure(total) {
+                if let Err(error) =
+                    evaluation_reserve(budget, &mut refreshed, || credit.ensure(total))
+                {
                     // Pins must not prevent the independent reclaimer from
                     // making progress while admission shrinks or waits.
                     drop(group);
                     drop(ids);
                     drop(credit);
+                    if !capacity_denial(&error) {
+                        failure("pressure evaluation block group", error);
+                    }
                     if count > 1 {
                         if let Some(probe) = &mut probe {
                             probe.shrinks = probe.shrinks.saturating_add(1);
@@ -1643,7 +2129,7 @@ pub(super) fn evaluate_from(
                         probe.retry_waits = probe.retry_waits.saturating_add(1);
                         probe.report_if_due(layer_index, start, count, "block_retry", total);
                     }
-                    if retry(workspace, started) {
+                    if retry_for(workspace, started, total) {
                         continue;
                     }
                     failure("pressure evaluation block group", error);
@@ -1750,8 +2236,8 @@ fn calculate(
                 id,
                 blocks[slot].1.evaluate(
                     equation.terms.clone(),
-                    &equation.constant,
-                    equation.divisor.as_ref(),
+                    equation.constant(),
+                    equation.divisor(),
                     values,
                 ),
             )
@@ -1785,24 +2271,9 @@ mod tests {
         });
         let plan = Plan {
             equations: vec![
-                PackedEquation {
-                    constant: Q::from(5),
-                    divisor: Some(Q::from(3)),
-                    block: 1,
-                    terms: 0..1,
-                },
-                PackedEquation {
-                    constant: Q::ZERO,
-                    divisor: None,
-                    block: 0,
-                    terms: 1..2,
-                },
-                PackedEquation {
-                    constant: Q::from(1),
-                    divisor: None,
-                    block: 0,
-                    terms: 0..1,
-                },
+                PackedEquation::new(Q::from(5), Some(Q::from(3)), 1, 0..1),
+                PackedEquation::new(Q::ZERO, None, 0, 1..2),
+                PackedEquation::new(Q::from(1), None, 0, 0..1),
             ],
             terms: Vec::new(),
             layers: Vec::new(),

@@ -40,17 +40,24 @@ impl Run {
         }
     }
 
-    pub(super) fn evaluated(&self, engine: &Engine) {
+    pub(super) fn evaluated(&self, engine: &Engine, plan: &Plan) {
         if let Some(sampler) = &self.sampler {
             println!("memory {:?}", sampler.sample("values_ready"));
             inspect_values(engine);
+            if let Some(workspace) = &plan.workspace {
+                println!(
+                    "layout workspace label=after_evaluation {:?}",
+                    workspace.snapshot()
+                );
+            }
             sampler.set_phase(super::measure_memory::Phase::Release);
         }
     }
 
-    pub(super) fn resized(&self) {
+    pub(super) fn resized(&self, engine: &Engine) {
         if let Some(sampler) = &self.sampler {
             println!("memory {:?}", sampler.sample("value_slots_allocated"));
+            inspect_engine_values("value_slots_allocated", engine);
         }
     }
 
@@ -82,7 +89,10 @@ impl Run {
                 "memory_samples count={} worker_panicked={} residual_rows={}",
                 report.samples.len(),
                 report.worker_panicked,
-                engine.values.len(),
+                engine
+                    .source
+                    .as_ref()
+                    .map_or_else(|| engine.values.len(), |source| source.read().len()),
             );
         }
     }
@@ -495,42 +505,75 @@ pub(super) fn inspect_plan(engine: &Engine, plan: &Plan) {
     let equation_heap_min: usize = plan
         .equations
         .iter()
+        .map(|equation| heap_min(equation.constant()) + equation.divisor().map_or(0, heap_min))
+        .sum();
+    let equation_box_inline_bytes: usize = plan
+        .equations
+        .iter()
         .map(|equation| {
-            heap_min(&equation.constant) + equation.divisor.as_ref().map_or(0, heap_min)
+            (usize::from(equation.constant.is_some()) + usize::from(equation.divisor.is_some()))
+                * std::mem::size_of::<Q>()
         })
         .sum();
     let mut keys = 0;
     let mut key_bytes = 0;
+    let mut index_inline_bytes = 0usize;
     for row in &engine.index {
         for shard in row {
             let index = shard.read().unwrap();
             for (ch, entries) in index.iter() {
+                index_inline_bytes +=
+                    std::mem::size_of::<(Vec<(u32, u32)>, BTreeMap<Vec<u32>, usize>)>();
                 key_bytes += ch.capacity() * std::mem::size_of::<(u32, u32)>();
                 for d in entries.keys() {
                     keys += 1;
+                    index_inline_bytes += std::mem::size_of::<(Vec<u32>, usize)>();
                     key_bytes += d.capacity() * std::mem::size_of::<u32>();
                 }
             }
         }
     }
     println!(
-        "layout plan equations={} equation_capacity_bytes={} compact_capacity_bytes={} wide_capacity_bytes={} layer_capacity_bytes={} wide_extra_heap_min_bytes={wide_heap_min} equation_heap_min_bytes={equation_heap_min} blocks={} largest_block_capacity_bytes={largest_block_bytes} largest_equation_terms={largest_equation_terms} index_keys={keys} index_key_payload_bytes={key_bytes} btree_nodes_not_included=true",
+        "layout plan equations={} packed_equation_size={} nonzero_constants={} divisors={} equation_capacity_bytes={} compact_capacity_bytes={} wide_capacity_bytes={} layer_capacity_bytes={} wide_extra_heap_min_bytes={wide_heap_min} equation_heap_min_bytes={equation_heap_min} equation_box_inline_bytes={equation_box_inline_bytes} blocks={} largest_block_capacity_bytes={largest_block_bytes} largest_equation_terms={largest_equation_terms} index_keys={keys} index_entry_inline_payload_bytes={index_inline_bytes} index_key_heap_capacity_bytes={key_bytes} btree_node_and_box_allocator_overhead_not_included=true",
         plan.equations.len(),
+        std::mem::size_of::<PackedEquation>(),
+        plan.equations
+            .iter()
+            .filter(|equation| equation.constant.is_some())
+            .count(),
+        plan.equations
+            .iter()
+            .filter(|equation| equation.divisor.is_some())
+            .count(),
         plan.equations.capacity() * std::mem::size_of::<PackedEquation>(),
         compact * std::mem::size_of::<CompactTerm>(),
         wide * std::mem::size_of::<Term>(),
         layer_slots * std::mem::size_of::<usize>(),
         plan.terms.len(),
     );
-    print_values(
-        "before_evaluation",
-        &engine.values,
-        engine.values.capacity(),
-    );
+    inspect_engine_values("before_evaluation", engine);
+    if let Some(workspace) = &plan.workspace {
+        println!(
+            "layout workspace label=before_evaluation {:?}",
+            workspace.snapshot()
+        );
+    }
 }
 
 pub(super) fn inspect_values(engine: &Engine) {
-    print_values("after_evaluation", &engine.values, engine.values.capacity());
+    inspect_engine_values("after_evaluation", engine);
+}
+
+fn inspect_engine_values(label: &str, engine: &Engine) {
+    if let Some(source) = &engine.source {
+        {
+            let values = source.read();
+            print_values(label, &values, values.capacity());
+        }
+        source.inspect_layout(label);
+    } else {
+        print_values(label, &engine.values, engine.values.capacity());
+    }
 }
 
 #[test]
